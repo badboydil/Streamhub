@@ -2509,6 +2509,11 @@ jobs:
               <item name="search_box" type="id" />
           </resources>
           STREAMHUB_EOF
+          cat > build.gradle <<'STREAMHUB_EOF'
+          plugins {
+              id 'com.android.application' version '8.7.3' apply false
+          }
+          STREAMHUB_EOF
           cat > gradle.properties <<'STREAMHUB_EOF'
           org.gradle.jvmargs=-Xmx3g
           android.useAndroidX=true
