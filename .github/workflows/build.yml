@@ -2,6 +2,7 @@ name: Build StreamHub
 
 on:
   push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -36,8 +37,8 @@ jobs:
                   applicationId 'com.dil.streamhub'
                   minSdk 22
                   targetSdk 34
-                  versionCode 1
-                  versionName '1.0'
+                  versionCode 2
+                  versionName '2.0'
               }
               signingConfigs {
                   hub {
@@ -61,6 +62,14 @@ jobs:
                   abortOnError false
                   checkReleaseBuilds false
               }
+          }
+
+          dependencies {
+              implementation platform('org.jetbrains.kotlin:kotlin-bom:1.8.22')
+              implementation 'androidx.media3:media3-exoplayer:1.4.1'
+              implementation 'androidx.media3:media3-exoplayer-hls:1.4.1'
+              implementation 'androidx.media3:media3-extractor:1.4.1'
+              implementation 'androidx.media3:media3-ui:1.4.1'
           }
           STREAMHUB_EOF
           mkdir -p app
@@ -105,6 +114,7 @@ jobs:
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+              <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
               <uses-feature android:name="android.software.leanback" android:required="false" />
               <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
@@ -124,6 +134,8 @@ jobs:
                   android:label="StreamHub"
                   android:icon="@drawable/icon"
                   android:banner="@drawable/banner"
+                  android:usesCleartextTraffic="true"
+                  android:largeHeap="true"
                   android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
                   <activity
                       android:name=".MainActivity"
@@ -136,8 +148,887 @@ jobs:
                           <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
                       </intent-filter>
                   </activity>
+                  <activity
+                      android:name=".IptvActivity"
+                      android:exported="false"
+                      android:configChanges="keyboardHidden|keyboard|navigation"
+                      android:windowSoftInputMode="stateHidden|adjustResize" />
+                  <activity
+                      android:name=".LoginActivity"
+                      android:exported="false"
+                      android:windowSoftInputMode="stateHidden|adjustResize" />
+                  <activity
+                      android:name=".PlayerActivity"
+                      android:exported="false"
+                      android:screenOrientation="sensorLandscape"
+                      android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|navigation"
+                      android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
               </application>
           </manifest>
+          STREAMHUB_EOF
+          mkdir -p app/src/main/java/com/dil/streamhub
+          cat > app/src/main/java/com/dil/streamhub/ImageLoader.java <<'STREAMHUB_EOF'
+          package com.dil.streamhub;
+
+          import android.graphics.Bitmap;
+          import android.graphics.BitmapFactory;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.util.LruCache;
+          import android.widget.ImageView;
+
+          import java.io.BufferedInputStream;
+          import java.io.ByteArrayOutputStream;
+          import java.io.InputStream;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.util.Collections;
+          import java.util.HashSet;
+          import java.util.Set;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+
+          /** Tiny poster/logo loader with a memory cache. */
+          final class ImageLoader {
+              private static final ExecutorService POOL = Executors.newFixedThreadPool(4);
+              private static final Handler MAIN = new Handler(Looper.getMainLooper());
+              private static final Set<String> FAILED = Collections.synchronizedSet(new HashSet<String>());
+              private static final LruCache<String, Bitmap> CACHE =
+                  new LruCache<String, Bitmap>((int) Math.min(Runtime.getRuntime().maxMemory() / 8, 24L * 1024 * 1024)) {
+                      @Override
+                      protected int sizeOf(String key, Bitmap b) {
+                          return b.getByteCount();
+                      }
+                  };
+
+              private ImageLoader() {}
+
+              static void load(final ImageView v, final String url, final int targetPx) {
+                  v.setTag(url);
+                  v.setImageDrawable(null);
+                  if (url == null || url.isEmpty() || FAILED.contains(url)) return;
+                  Bitmap cached = CACHE.get(url);
+                  if (cached != null) {
+                      v.setImageBitmap(cached);
+                      return;
+                  }
+                  POOL.execute(() -> {
+                      if (!url.equals(v.getTag())) return; // row was reused before we started
+                      final Bitmap bmp = fetch(url, targetPx);
+                      if (bmp == null) {
+                          FAILED.add(url);
+                          return;
+                      }
+                      CACHE.put(url, bmp);
+                      MAIN.post(() -> {
+                          if (url.equals(v.getTag())) v.setImageBitmap(bmp);
+                      });
+                  });
+              }
+
+              private static Bitmap fetch(String url, int target) {
+                  HttpURLConnection c = null;
+                  try {
+                      c = (HttpURLConnection) new URL(url).openConnection();
+                      c.setConnectTimeout(8000);
+                      c.setReadTimeout(12000);
+                      c.setRequestProperty("User-Agent", Xtream.UA);
+                      c.setInstanceFollowRedirects(true);
+                      if (c.getResponseCode() >= 400) return null;
+                      InputStream in = new BufferedInputStream(c.getInputStream());
+                      ByteArrayOutputStream o = new ByteArrayOutputStream();
+                      byte[] buf = new byte[8192];
+                      int n, total = 0;
+                      while ((n = in.read(buf)) > 0) {
+                          o.write(buf, 0, n);
+                          total += n;
+                          if (total > 4 * 1024 * 1024) { in.close(); return null; }
+                      }
+                      in.close();
+                      byte[] data = o.toByteArray();
+                      BitmapFactory.Options bounds = new BitmapFactory.Options();
+                      bounds.inJustDecodeBounds = true;
+                      BitmapFactory.decodeByteArray(data, 0, data.length, bounds);
+                      if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null;
+                      int sample = 1;
+                      while (bounds.outWidth / (sample * 2) >= target && bounds.outHeight / (sample * 2) >= target) sample *= 2;
+                      BitmapFactory.Options opt = new BitmapFactory.Options();
+                      opt.inSampleSize = sample;
+                      return BitmapFactory.decodeByteArray(data, 0, data.length, opt);
+                  } catch (Throwable t) {
+                      return null;
+                  } finally {
+                      if (c != null) c.disconnect();
+                  }
+              }
+          }
+          STREAMHUB_EOF
+          mkdir -p app/src/main/java/com/dil/streamhub
+          cat > app/src/main/java/com/dil/streamhub/IptvActivity.java <<'STREAMHUB_EOF'
+          package com.dil.streamhub;
+
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.content.Intent;
+          import android.content.res.Configuration;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.text.Editable;
+          import android.text.TextUtils;
+          import android.text.TextWatcher;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.view.inputmethod.EditorInfo;
+          import android.view.inputmethod.InputMethodManager;
+          import android.widget.AdapterView;
+          import android.widget.BaseAdapter;
+          import android.widget.EditText;
+          import android.widget.ImageView;
+          import android.widget.LinearLayout;
+          import android.widget.ListView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          import java.util.ArrayList;
+          import java.util.LinkedHashMap;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Set;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+
+          /** Browse and search the subscriber's live channels, movies or series. */
+          public class IptvActivity extends Activity {
+
+              public static final String EXTRA_KIND = "kind";
+              public static final String EXTRA_QUERY = "query";
+
+              private static final String FAV = "\u0001fav";
+              private static final String ALL = "\u0001all";
+
+              private Xtream x;
+              private String kind;
+              private boolean tv;
+
+              private static final ExecutorService bg = Executors.newSingleThreadExecutor();
+              private static final ExecutorService epgPool = Executors.newSingleThreadExecutor();
+              private final Handler main = new Handler(Looper.getMainLooper());
+
+              private final List<Xtream.Category> cats = new ArrayList<>();
+              private List<Xtream.Item> shown = new ArrayList<>();
+              private Set<String> favKeys;
+              private String currentCat = null;
+              private int loadToken = 0;
+              private boolean suppressSearch = false;
+
+              private ListView catList, itemList;
+              private TextView status, info;
+              private EditText search;
+              private CatAdapter catAdapter;
+              private ItemAdapter itemAdapter;
+
+              private Runnable pendingCat, pendingSearch, pendingEpg;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  x = Xtream.fromPrefs(this);
+                  if (x == null) {
+                      startActivity(new Intent(this, LoginActivity.class));
+                      finish();
+                      return;
+                  }
+                  kind = getIntent().getStringExtra(EXTRA_KIND);
+                  if (kind == null) kind = Xtream.LIVE;
+                  tv = Ui.isTv(this);
+                  favKeys = Xtream.favKeys(this);
+                  buildUi();
+                  loadCategories();
+
+                  String q = getIntent().getStringExtra(EXTRA_QUERY);
+                  if (q != null && !q.trim().isEmpty()) {
+                      search.setText(q.trim()); // triggers the search
+                  }
+              }
+
+              @Override
+              protected void onDestroy() {
+                  super.onDestroy();
+                  main.removeCallbacksAndMessages(null);
+              }
+
+              private String kindWord(boolean plural) {
+                  switch (kind) {
+                      case Xtream.LIVE: return plural ? "channels" : "channel";
+                      case Xtream.MOVIE: return plural ? "movies" : "movie";
+                      default: return plural ? "series" : "series";
+                  }
+              }
+
+              // ---------- UI ----------
+
+              private void buildUi() {
+                  int pad = tv ? Ui.dp(this, 32) : Ui.dp(this, 12);
+                  boolean wide = getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE;
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setBackgroundColor(Ui.BG);
+                  root.setPadding(pad, pad, pad, pad);
+
+                  // Top bar
+                  LinearLayout top = new LinearLayout(this);
+                  top.setOrientation(LinearLayout.HORIZONTAL);
+                  top.setGravity(Gravity.CENTER_VERTICAL);
+                  root.addView(top, new LinearLayout.LayoutParams(
+                      ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+                  TextView title = new TextView(this);
+                  title.setText(kind.equals(Xtream.LIVE) ? "Live TV" : kind.equals(Xtream.MOVIE) ? "Movies" : "Series");
+                  title.setTextColor(Color.WHITE);
+                  title.setTextSize(tv ? 28 : 22);
+                  title.setTypeface(Typeface.DEFAULT_BOLD);
+                  title.setPadding(0, 0, Ui.dp(this, 16), 0);
+                  top.addView(title);
+
+                  search = new EditText(this);
+                  search.setHint("Search " + kindWord(true) + "…");
+                  search.setHintTextColor(0xFF777780);
+                  search.setTextColor(Color.WHITE);
+                  search.setTextSize(17);
+                  search.setSingleLine(true);
+                  search.setImeOptions(EditorInfo.IME_ACTION_SEARCH);
+                  search.setBackground(Ui.states(this, Ui.FIELD, 10));
+                  search.setPadding(Ui.dp(this, 14), Ui.dp(this, 8), Ui.dp(this, 14), Ui.dp(this, 8));
+                  top.addView(search, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+                  status = new TextView(this);
+                  status.setTextColor(Ui.MUTED);
+                  status.setTextSize(14);
+                  status.setPadding(0, Ui.dp(this, 8), 0, Ui.dp(this, 8));
+                  root.addView(status);
+
+                  // Body: categories + items
+                  LinearLayout body = new LinearLayout(this);
+                  body.setOrientation(wide ? LinearLayout.HORIZONTAL : LinearLayout.VERTICAL);
+                  root.addView(body, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+                  catList = new ListView(this);
+                  catList.setDivider(null);
+                  catList.setSelector(Ui.solid(this, 0xFF3A2A55, 10));
+                  catList.setBackground(Ui.solid(this, Ui.SURFACE, 14));
+                  catList.setPadding(Ui.dp(this, 6), Ui.dp(this, 6), Ui.dp(this, 6), Ui.dp(this, 6));
+                  catList.setClipToPadding(false);
+                  catAdapter = new CatAdapter();
+                  catList.setAdapter(catAdapter);
+
+                  itemList = new ListView(this);
+                  itemList.setDivider(null);
+                  itemList.setSelector(Ui.solid(this, Ui.ACCENT, 10));
+                  itemList.setPadding(Ui.dp(this, 6), Ui.dp(this, 6), Ui.dp(this, 6), Ui.dp(this, 6));
+                  itemList.setClipToPadding(false);
+                  itemAdapter = new ItemAdapter();
+                  itemList.setAdapter(itemAdapter);
+
+                  if (wide) {
+                      LinearLayout.LayoutParams cl = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f);
+                      cl.rightMargin = Ui.dp(this, 12);
+                      body.addView(catList, cl);
+                      body.addView(itemList, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 2.3f));
+                  } else {
+                      LinearLayout.LayoutParams cl = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
+                      cl.bottomMargin = Ui.dp(this, 10);
+                      body.addView(catList, cl);
+                      body.addView(itemList, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 2.2f));
+                  }
+
+                  info = new TextView(this);
+                  info.setTextColor(Color.WHITE);
+                  info.setTextSize(15);
+                  info.setMaxLines(3);
+                  info.setEllipsize(TextUtils.TruncateAt.END);
+                  info.setPadding(0, Ui.dp(this, 10), 0, 0);
+                  info.setText(kind.equals(Xtream.SERIES)
+                      ? "Pick a series to see its seasons and episodes. Hold OK on one to add it to Favourites."
+                      : "Hold OK (or long-press) on a " + kindWord(false)
+                        + " to add it to Favourites or play it in another app.");
+                  root.addView(info);
+
+                  setContentView(root);
+
+                  // Categories
+                  catList.setOnItemClickListener((p, v, pos, id) -> {
+                      clearSearchQuietly();
+                      showCategory(cats.get(pos).id);
+                      itemList.requestFocus();
+                  });
+                  catList.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+                      @Override
+                      public void onItemSelected(AdapterView<?> parent, View view, final int pos, long id) {
+                          if (pendingCat != null) main.removeCallbacks(pendingCat);
+                          pendingCat = () -> {
+                              if (pos < cats.size() && !cats.get(pos).id.equals(currentCat)) {
+                                  clearSearchQuietly();
+                                  showCategory(cats.get(pos).id);
+                              }
+                          };
+                          main.postDelayed(pendingCat, 450);
+                      }
+
+                      @Override
+                      public void onNothingSelected(AdapterView<?> parent) {}
+                  });
+
+                  // Items
+                  itemList.setOnItemClickListener((p, v, pos, id) -> openItem(pos));
+                  itemList.setOnItemLongClickListener((p, v, pos, id) -> {
+                      itemOptions(pos);
+                      return true;
+                  });
+                  if (kind.equals(Xtream.LIVE)) {
+                      itemList.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+                          @Override
+                          public void onItemSelected(AdapterView<?> parent, View view, int pos, long id) {
+                              if (pos >= shown.size()) return;
+                              final Xtream.Item it = shown.get(pos);
+                              info.setText(it.name);
+                              if (pendingEpg != null) main.removeCallbacks(pendingEpg);
+                              pendingEpg = () -> epgPool.execute(() -> {
+                                  final String epg = x.nowNext(it.id);
+                                  main.post(() -> {
+                                      int sel = itemList.getSelectedItemPosition();
+                                      if (sel >= 0 && sel < shown.size() && shown.get(sel) == it) {
+                                          info.setText(epg.isEmpty() ? it.name : it.name + "\n" + epg);
+                                      }
+                                  });
+                              });
+                              main.postDelayed(pendingEpg, 600);
+                          }
+
+                          @Override
+                          public void onNothingSelected(AdapterView<?> parent) {}
+                      });
+                  }
+
+                  // Search
+                  search.addTextChangedListener(new TextWatcher() {
+                      public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
+                      public void onTextChanged(CharSequence s, int a, int b, int c) {}
+                      public void afterTextChanged(Editable s) {
+                          if (suppressSearch) return;
+                          if (pendingSearch != null) main.removeCallbacks(pendingSearch);
+                          pendingSearch = () -> runSearch(search.getText().toString().trim());
+                          main.postDelayed(pendingSearch, 500);
+                      }
+                  });
+                  search.setOnEditorActionListener((v, actionId, event) -> {
+                      InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+                      if (imm != null) imm.hideSoftInputFromWindow(search.getWindowToken(), 0);
+                      itemList.requestFocus();
+                      return true;
+                  });
+              }
+
+              private void clearSearchQuietly() {
+                  if (search.getText().length() == 0) return;
+                  suppressSearch = true;
+                  search.setText("");
+                  suppressSearch = false;
+              }
+
+              private void setStatus(String s) {
+                  status.setText(s);
+              }
+
+              private void setItems(List<Xtream.Item> items) {
+                  shown = items;
+                  itemAdapter.notifyDataSetChanged();
+                  itemList.setSelection(0);
+              }
+
+              // ---------- loading ----------
+
+              private void loadCategories() {
+                  setStatus("Loading categories…");
+                  bg.execute(() -> {
+                      try {
+                          final List<Xtream.Category> list = x.categories(kind);
+                          main.post(() -> {
+                              cats.clear();
+                              cats.add(new Xtream.Category(FAV, "★ Favourites"));
+                              cats.add(new Xtream.Category(ALL, "All " + kindWord(true)));
+                              cats.addAll(list);
+                              catAdapter.notifyDataSetChanged();
+                              if (currentCat == null && search.getText().length() == 0) {
+                                  String first;
+                                  if (!Xtream.favourites(this, kind).isEmpty()) first = FAV;
+                                  else if (list.isEmpty()) first = ALL;
+                                  else first = list.get(0).id;
+                                  showCategory(first);
+                                  catList.setSelection(indexOfCat(first));
+                              }
+                          });
+                      } catch (final Exception e) {
+                          main.post(() -> setStatus(Xtream.friendly(e) + "  Hold OK on the Live TV tile to check your IPTV login."));
+                      }
+                  });
+              }
+
+              private int indexOfCat(String id) {
+                  for (int i = 0; i < cats.size(); i++) if (cats.get(i).id.equals(id)) return i;
+                  return 0;
+              }
+
+              private String catName(String id) {
+                  for (Xtream.Category c : cats) if (c.id.equals(id)) return c.name;
+                  return "";
+              }
+
+              private void showCategory(final String catId) {
+                  currentCat = catId;
+                  catAdapter.notifyDataSetChanged();
+                  final int token = ++loadToken;
+                  if (FAV.equals(catId)) {
+                      List<Xtream.Item> favs = Xtream.favourites(this, kind);
+                      setItems(favs);
+                      setStatus(favs.isEmpty()
+                          ? "No favourites yet. Hold OK on a " + kindWord(false) + " to add it."
+                          : "Favourites · " + favs.size());
+                      return;
+                  }
+                  setStatus("Loading " + catName(catId) + "…");
+                  bg.execute(() -> {
+                      try {
+                          final List<Xtream.Item> items = x.items(kind, ALL.equals(catId) ? null : catId);
+                          main.post(() -> {
+                              if (token != loadToken) return;
+                              setItems(items);
+                              setStatus(catName(catId) + " · " + items.size() + " " + kindWord(items.size() != 1));
+                          });
+                      } catch (final Exception e) {
+                          main.post(() -> {
+                              if (token != loadToken) return;
+                              setItems(new ArrayList<Xtream.Item>());
+                              setStatus(Xtream.friendly(e));
+                          });
+                      }
+                  });
+              }
+
+              private void runSearch(final String q) {
+                  if (q.isEmpty()) {
+                      showCategory(currentCat == null ? ALL : currentCat);
+                      return;
+                  }
+                  final int token = ++loadToken;
+                  setStatus("Searching all " + kindWord(true) + " for “" + q + "”… (the first search takes a moment)");
+                  bg.execute(() -> {
+                      try {
+                          List<Xtream.Item> all = x.items(kind, null);
+                          String ql = q.toLowerCase(Locale.ROOT);
+                          final List<Xtream.Item> out = new ArrayList<>();
+                          for (Xtream.Item i : all) {
+                              if (i.name.toLowerCase(Locale.ROOT).contains(ql)) out.add(i);
+                          }
+                          main.post(() -> {
+                              if (token != loadToken) return;
+                              setItems(out);
+                              setStatus(out.isEmpty()
+                                  ? "No " + kindWord(true) + " match “" + q + "”."
+                                  : out.size() + " " + kindWord(out.size() != 1) + " match “" + q + "”");
+                          });
+                      } catch (final Exception e) {
+                          main.post(() -> {
+                              if (token == loadToken) setStatus(Xtream.friendly(e));
+                          });
+                      }
+                  });
+              }
+
+              // ---------- actions ----------
+
+              private void openItem(int pos) {
+                  if (pos < 0 || pos >= shown.size()) return;
+                  Xtream.Item it = shown.get(pos);
+                  if (kind.equals(Xtream.LIVE)) {
+                      ArrayList<PlayerActivity.Entry> list = new ArrayList<>();
+                      for (Xtream.Item i : shown) list.add(new PlayerActivity.Entry(i.name, x.liveUrl(i)));
+                      PlayerActivity.start(this, list, pos, true);
+                  } else if (kind.equals(Xtream.MOVIE)) {
+                      ArrayList<PlayerActivity.Entry> list = new ArrayList<>();
+                      list.add(new PlayerActivity.Entry(it.name, x.movieUrl(it)));
+                      PlayerActivity.start(this, list, 0, false);
+                  } else {
+                      openSeries(it);
+                  }
+              }
+
+              private void openSeries(final Xtream.Item it) {
+                  setStatus("Loading episodes of " + it.name + "…");
+                  bg.execute(() -> {
+                      try {
+                          final LinkedHashMap<String, List<Xtream.Episode>> s = x.seasons(it.id);
+                          main.post(() -> {
+                              setStatus(it.name);
+                              pickSeason(it, s);
+                          });
+                      } catch (final Exception e) {
+                          main.post(() -> setStatus(Xtream.friendly(e)));
+                      }
+                  });
+              }
+
+              private void pickSeason(final Xtream.Item it, final LinkedHashMap<String, List<Xtream.Episode>> seasons) {
+                  if (isFinishing()) return;
+                  if (seasons.isEmpty()) {
+                      toast("No episodes found for " + it.name + ".");
+                      return;
+                  }
+                  final List<String> keys = new ArrayList<>(seasons.keySet());
+                  if (keys.size() == 1) {
+                      pickEpisode(it, keys.get(0), seasons.get(keys.get(0)));
+                      return;
+                  }
+                  String[] labels = new String[keys.size()];
+                  for (int i = 0; i < keys.size(); i++) {
+                      int n = seasons.get(keys.get(i)).size();
+                      labels[i] = "Season " + keys.get(i) + "   (" + n + (n == 1 ? " episode)" : " episodes)");
+                  }
+                  new AlertDialog.Builder(this)
+                      .setTitle(it.name)
+                      .setItems(labels, (d, w) -> pickEpisode(it, keys.get(w), seasons.get(keys.get(w))))
+                      .setNegativeButton("Cancel", null)
+                      .show();
+              }
+
+              private void pickEpisode(final Xtream.Item it, String season, final List<Xtream.Episode> eps) {
+                  String[] labels = new String[eps.size()];
+                  for (int i = 0; i < eps.size(); i++) {
+                      Xtream.Episode e = eps.get(i);
+                      String t = e.title == null ? "" : e.title;
+                      labels[i] = "Episode " + e.num + (t.isEmpty() ? "" : "  ·  " + t);
+                  }
+                  new AlertDialog.Builder(this)
+                      .setTitle(it.name + " · Season " + season)
+                      .setItems(labels, (d, w) -> {
+                          ArrayList<PlayerActivity.Entry> list = new ArrayList<>();
+                          for (Xtream.Episode e : eps) {
+                              list.add(new PlayerActivity.Entry(it.name + " · S" + e.season + " E" + e.num, x.episodeUrl(e)));
+                          }
+                          PlayerActivity.start(this, list, w, false);
+                      })
+                      .setNegativeButton("Cancel", null)
+                      .show();
+              }
+
+              private void itemOptions(int pos) {
+                  if (pos < 0 || pos >= shown.size()) return;
+                  final Xtream.Item it = shown.get(pos);
+                  boolean fav = favKeys.contains(it.key());
+                  List<String> opts = new ArrayList<>();
+                  opts.add(fav ? "Remove from Favourites" : "Add to Favourites");
+                  if (!kind.equals(Xtream.SERIES)) opts.add("Play in another app (VLC, MX Player…)");
+                  new AlertDialog.Builder(this)
+                      .setTitle(it.name)
+                      .setItems(opts.toArray(new String[0]), (d, w) -> {
+                          if (w == 0) {
+                              boolean now = Xtream.toggleFav(this, it);
+                              favKeys = Xtream.favKeys(this);
+                              toast(now ? "Added to Favourites" : "Removed from Favourites");
+                              if (FAV.equals(currentCat) && search.getText().length() == 0) showCategory(FAV);
+                              else itemAdapter.notifyDataSetChanged();
+                          } else {
+                              playExternal(it);
+                          }
+                      })
+                      .setNegativeButton("Cancel", null)
+                      .show();
+              }
+
+              private void playExternal(Xtream.Item it) {
+                  String url = kind.equals(Xtream.LIVE) ? x.liveUrl(it) : x.movieUrl(it);
+                  Intent i = new Intent(Intent.ACTION_VIEW);
+                  i.setDataAndType(Uri.parse(url), "video/*");
+                  i.putExtra("title", it.name);
+                  try {
+                      startActivity(Intent.createChooser(i, "Play with"));
+                  } catch (Exception e) {
+                      toast("No other video player is installed.");
+                  }
+              }
+
+              private void toast(String s) {
+                  Toast.makeText(this, s, Toast.LENGTH_LONG).show();
+              }
+
+              // ---------- adapters ----------
+
+              private class CatAdapter extends BaseAdapter {
+                  @Override public int getCount() { return cats.size(); }
+                  @Override public Object getItem(int p) { return cats.get(p); }
+                  @Override public long getItemId(int p) { return p; }
+
+                  @Override
+                  public View getView(int p, View convert, ViewGroup parent) {
+                      TextView t = convert instanceof TextView ? (TextView) convert : new TextView(IptvActivity.this);
+                      Xtream.Category c = cats.get(p);
+                      t.setText(c.name);
+                      boolean current = c.id.equals(currentCat);
+                      t.setTextColor(current ? 0xFFD9B8FF : Color.WHITE);
+                      t.setTypeface(current ? Typeface.DEFAULT_BOLD : Typeface.DEFAULT);
+                      t.setTextSize(tv ? 18 : 16);
+                      t.setSingleLine(true);
+                      t.setEllipsize(TextUtils.TruncateAt.END);
+                      t.setPadding(Ui.dp(IptvActivity.this, 14), Ui.dp(IptvActivity.this, 10),
+                          Ui.dp(IptvActivity.this, 14), Ui.dp(IptvActivity.this, 10));
+                      return t;
+                  }
+              }
+
+              private class ItemAdapter extends BaseAdapter {
+                  @Override public int getCount() { return shown.size(); }
+                  @Override public Object getItem(int p) { return shown.get(p); }
+                  @Override public long getItemId(int p) { return p; }
+
+                  @Override
+                  public View getView(int p, View convert, ViewGroup parent) {
+                      LinearLayout row;
+                      ImageView img;
+                      TextView name;
+                      boolean live = kind.equals(Xtream.LIVE);
+                      int w = live ? Ui.dp(IptvActivity.this, tv ? 72 : 60) : Ui.dp(IptvActivity.this, tv ? 54 : 44);
+                      int h = live ? Ui.dp(IptvActivity.this, tv ? 44 : 36) : Ui.dp(IptvActivity.this, tv ? 80 : 66);
+                      if (convert instanceof LinearLayout) {
+                          row = (LinearLayout) convert;
+                          img = (ImageView) row.getChildAt(0);
+                          name = (TextView) row.getChildAt(1);
+                      } else {
+                          row = new LinearLayout(IptvActivity.this);
+                          row.setOrientation(LinearLayout.HORIZONTAL);
+                          row.setGravity(Gravity.CENTER_VERTICAL);
+                          int pd = Ui.dp(IptvActivity.this, 8);
+                          row.setPadding(pd, pd / 2, pd, pd / 2);
+                          img = new ImageView(IptvActivity.this);
+                          img.setScaleType(live ? ImageView.ScaleType.FIT_CENTER : ImageView.ScaleType.CENTER_CROP);
+                          img.setBackground(Ui.solid(IptvActivity.this, Ui.SURFACE, 6));
+                          LinearLayout.LayoutParams ip = new LinearLayout.LayoutParams(w, h);
+                          ip.rightMargin = Ui.dp(IptvActivity.this, 14);
+                          row.addView(img, ip);
+                          name = new TextView(IptvActivity.this);
+                          name.setTextColor(Color.WHITE);
+                          name.setTextSize(tv ? 19 : 16);
+                          name.setMaxLines(2);
+                          name.setEllipsize(TextUtils.TruncateAt.END);
+                          row.addView(name, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+                      }
+                      Xtream.Item it = shown.get(p);
+                      String prefix = live ? (p + 1) + ".  " : "";
+                      name.setText((favKeys.contains(it.key()) ? "★ " : "") + prefix + it.name);
+                      ImageLoader.load(img, it.icon, Math.max(w, h));
+                      return row;
+                  }
+              }
+          }
+          STREAMHUB_EOF
+          mkdir -p app/src/main/java/com/dil/streamhub
+          cat > app/src/main/java/com/dil/streamhub/LoginActivity.java <<'STREAMHUB_EOF'
+          package com.dil.streamhub;
+
+          import android.app.Activity;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.text.InputType;
+          import android.view.ViewGroup;
+          import android.widget.Button;
+          import android.widget.CheckBox;
+          import android.widget.EditText;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+
+          /** Where the user types the IPTV login their provider gave them. Stored only on this device. */
+          public class LoginActivity extends Activity {
+
+              private EditText server, user, pass;
+              private CheckBox hls;
+              private TextView status;
+              private Button save;
+              private boolean tv;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  tv = Ui.isTv(this);
+                  int pad = tv ? Ui.dp(this, 48) : Ui.dp(this, 18);
+
+                  ScrollView scroll = new ScrollView(this);
+                  scroll.setBackgroundColor(Ui.BG);
+                  scroll.setFillViewport(true);
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(pad, pad, pad, pad);
+                  scroll.addView(root);
+
+                  TextView title = new TextView(this);
+                  title.setText("IPTV login");
+                  title.setTextColor(Color.WHITE);
+                  title.setTextSize(tv ? 30 : 26);
+                  title.setTypeface(Typeface.DEFAULT_BOLD);
+                  root.addView(title);
+
+                  TextView help = new TextView(this);
+                  help.setText("Enter the Xtream Codes login from your IPTV provider. If you only have a username and "
+                      + "password for MUK XC, ask your provider for “the server address for other apps like TiviMate”. "
+                      + "You can also paste a full M3U link into the server box and the rest fills in by itself.\n\n"
+                      + "Your login is saved only on this device.");
+                  help.setTextColor(Ui.MUTED);
+                  help.setTextSize(15);
+                  help.setPadding(0, Ui.dp(this, 6), 0, Ui.dp(this, 16));
+                  root.addView(help);
+
+                  server = field(root, "Server address", "http://example.com:8080", InputType.TYPE_TEXT_VARIATION_URI);
+                  user = field(root, "Username", "", InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
+                  pass = field(root, "Password", "", InputType.TYPE_TEXT_VARIATION_PASSWORD);
+
+                  hls = new CheckBox(this);
+                  hls.setText("Play live channels as HLS (.m3u8). Try this if channels won't play.");
+                  hls.setTextColor(Color.WHITE);
+                  hls.setTextSize(15);
+                  hls.setPadding(Ui.dp(this, 6), Ui.dp(this, 10), 0, Ui.dp(this, 10));
+                  root.addView(hls);
+
+                  LinearLayout buttons = new LinearLayout(this);
+                  buttons.setOrientation(LinearLayout.HORIZONTAL);
+                  buttons.setPadding(0, Ui.dp(this, 12), 0, 0);
+                  root.addView(buttons);
+
+                  save = Ui.button(this, "Check & save");
+                  save.setBackground(Ui.states(this, Ui.ACCENT, 12));
+                  Button signOut = Ui.button(this, "Sign out");
+                  Button done = Ui.button(this, "Done");
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                      ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                  lp.rightMargin = Ui.dp(this, 10);
+                  buttons.addView(save, lp);
+                  buttons.addView(signOut, new LinearLayout.LayoutParams(lp));
+                  buttons.addView(done, new LinearLayout.LayoutParams(lp));
+
+                  status = new TextView(this);
+                  status.setTextColor(Color.WHITE);
+                  status.setTextSize(16);
+                  status.setPadding(0, Ui.dp(this, 16), 0, 0);
+                  root.addView(status);
+
+                  Xtream saved = Xtream.fromPrefs(this);
+                  if (saved != null) {
+                      server.setText(saved.server);
+                      user.setText(saved.user);
+                      pass.setText(saved.pass);
+                      hls.setChecked(saved.hls);
+                      status.setText("You're signed in. Change the details and press Check & save to update them.");
+                  }
+
+                  save.setOnClickListener(v -> check());
+                  signOut.setOnClickListener(v -> {
+                      Xtream.signOut(this);
+                      server.setText("");
+                      user.setText("");
+                      pass.setText("");
+                      hls.setChecked(false);
+                      status.setText("Signed out. Live TV opens your MUK XC app again.");
+                  });
+                  done.setOnClickListener(v -> finish());
+
+                  setContentView(scroll);
+                  server.requestFocus();
+              }
+
+              private EditText field(LinearLayout root, String label, String hint, int variation) {
+                  TextView l = new TextView(this);
+                  l.setText(label);
+                  l.setTextColor(Ui.MUTED);
+                  l.setTextSize(14);
+                  l.setPadding(0, Ui.dp(this, 8), 0, Ui.dp(this, 4));
+                  root.addView(l);
+
+                  EditText e = new EditText(this);
+                  e.setSingleLine(true);
+                  e.setHint(hint);
+                  e.setHintTextColor(0xFF666670);
+                  e.setTextColor(Color.WHITE);
+                  e.setTextSize(18);
+                  e.setInputType(InputType.TYPE_CLASS_TEXT | variation);
+                  e.setBackground(Ui.states(this, Ui.FIELD, 10));
+                  e.setPadding(Ui.dp(this, 14), Ui.dp(this, 10), Ui.dp(this, 14), Ui.dp(this, 10));
+                  root.addView(e, new LinearLayout.LayoutParams(
+                      ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+                  return e;
+              }
+
+              private void check() {
+                  String s = server.getText().toString().trim();
+                  String u = user.getText().toString().trim();
+                  String p = pass.getText().toString().trim();
+
+                  // Accept a full M3U / player_api link and pull the login out of it.
+                  if (s.contains("username=")) {
+                      try {
+                          Uri link = Uri.parse(s.startsWith("http") ? s : "http://" + s);
+                          String lu = link.getQueryParameter("username");
+                          String lp = link.getQueryParameter("password");
+                          if (lu != null) { u = lu; user.setText(lu); }
+                          if (lp != null) { p = lp; pass.setText(lp); }
+                          s = Xtream.normalize(s);
+                          server.setText(s);
+                      } catch (Exception ignored) {}
+                  }
+
+                  if (s.isEmpty() || u.isEmpty()) {
+                      status.setText("Enter the server address and your username first.");
+                      return;
+                  }
+
+                  final Xtream x = new Xtream(s, u, p, hls.isChecked());
+                  status.setText("Checking your login…");
+                  save.setEnabled(false);
+                  new Thread(() -> {
+                      String msg;
+                      boolean ok = false;
+                      try {
+                          Xtream.Account a = x.login();
+                          if (a.ok) {
+                              x.save(this);
+                              ok = true;
+                              StringBuilder b = new StringBuilder("Connected ✓");
+                              if (!a.status.isEmpty()) b.append("\nAccount: ").append(a.status);
+                              if (!a.expires.isEmpty()) b.append("\nValid until: ").append(a.expires);
+                              if (!a.maxConn.isEmpty()) b.append("\nScreens at once: ").append(a.maxConn);
+                              b.append("\n\nPress Done to go back. The Live TV, Movies and Series tiles now use this login.");
+                              msg = b.toString();
+                          } else {
+                              msg = a.message;
+                          }
+                      } catch (Exception e) {
+                          msg = Xtream.friendly(e);
+                      }
+                      final String m = msg;
+                      final boolean success = ok;
+                      runOnUiThread(() -> {
+                          save.setEnabled(true);
+                          status.setText(m);
+                          if (success) setResult(RESULT_OK);
+                      });
+                  }).start();
+              }
+          }
           STREAMHUB_EOF
           mkdir -p app/src/main/java/com/dil/streamhub
           cat > app/src/main/java/com/dil/streamhub/MainActivity.java <<'STREAMHUB_EOF'
@@ -210,7 +1101,17 @@ jobs:
                           "com.google.android.youtube"}),
                   new Service("live", "Live TV", 0xFF6A1B9A, Color.WHITE,
                       new String[]{"com.nathnetwork.xciptv"}),
+                  new Service("movies", "Movies", 0xFFB5651D, Color.WHITE, new String[0]),
+                  new Service("series", "Series", 0xFF00796B, Color.WHITE, new String[0]),
               };
+
+              private static boolean builtIn(Service s) {
+                  return s.id.equals("movies") || s.id.equals("series");
+              }
+
+              private boolean iptv() {
+                  return Xtream.fromPrefs(this) != null;
+              }
 
               private SharedPreferences prefs;
               private PackageManager pm;
@@ -305,7 +1206,7 @@ jobs:
                   root.addView(title);
 
                   TextView sub = new TextView(this);
-                  sub.setText("Netflix, Prime Video, YouTube and Live TV in one place");
+                  sub.setText("Netflix, Prime Video, YouTube, Live TV, Movies and Series in one place");
                   sub.setTextColor(0xFFA0A0AA);
                   sub.setTextSize(15);
                   sub.setPadding(0, dp(2), 0, dp(18));
@@ -383,10 +1284,18 @@ jobs:
                   root.addView(hs);
                   rebuildList();
 
+                  Button iptvBtn = smallButton("IPTV login");
+                  iptvBtn.setOnClickListener(v -> startActivity(new Intent(this, LoginActivity.class)));
+                  LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(
+                      ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                  ilp.topMargin = dp(18);
+                  root.addView(iptvBtn, ilp);
+
                   TextView tip = new TextView(this);
-                  tip.setText("Tips: type a title, then pick a tile to search that app.  "
-                      + "Hold OK (or long-press) on a tile to choose which app it opens.  "
-                      + "Hold a My List title to remove it.");
+                  tip.setText("Tips: type a title, then pick a tile to search there.  "
+                      + "Hold OK (or long-press) on a tile for more options.  "
+                      + "Hold a My List title to remove it.  "
+                      + "While watching live TV, press Up/Down to change channel.");
                   tip.setTextColor(0xFF808088);
                   tip.setTextSize(13);
                   tip.setPadding(0, dp(20), 0, 0);
@@ -403,8 +1312,8 @@ jobs:
                   tileStatus.clear();
 
                   boolean wide = getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE;
-                  int cols = wide ? 4 : 2;
-                  int height = tv ? dp(170) : dp(130);
+                  int cols = wide ? 3 : 2;
+                  int height = tv ? dp(140) : dp(115);
 
                   LinearLayout row = null;
                   for (int i = 0; i < SERVICES.length; i++) {
@@ -443,7 +1352,7 @@ jobs:
                       tile.addView(status);
 
                       tile.setOnClickListener(v -> openService(s));
-                      tile.setOnLongClickListener(v -> { pickApp(s); return true; });
+                      tile.setOnLongClickListener(v -> { tileOptions(s); return true; });
 
                       LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, height, 1f);
                       lp.setMargins(dp(8), dp(8), dp(8), dp(8));
@@ -466,10 +1375,21 @@ jobs:
               private void refreshTiles() {
                   if (search == null) return;
                   String q = query();
+                  boolean loggedIn = iptv();
                   for (int i = 0; i < SERVICES.length && i < tileStatus.size(); i++) {
                       Service s = SERVICES[i];
-                      String pkg = resolvePkg(s);
                       String text;
+                      if (builtIn(s)) {
+                          text = !loggedIn ? "Set up IPTV login" : q.isEmpty() ? "Browse" : "Search \u201C" + q + "\u201D";
+                          tileStatus.get(i).setText(text);
+                          continue;
+                      }
+                      if (s.id.equals("live") && loggedIn) {
+                          text = q.isEmpty() ? "Channels & TV guide" : "Find \u201C" + q + "\u201D";
+                          tileStatus.get(i).setText(text);
+                          continue;
+                      }
+                      String pkg = resolvePkg(s);
                       if (pkg == null) {
                           text = "Not found – hold OK to choose the app";
                       } else if (q.isEmpty() || s.id.equals("live")) {
@@ -607,6 +1527,7 @@ jobs:
               }
 
               private String resolvePkg(Service s) {
+                  if (builtIn(s)) return null;
                   String saved = prefs.getString("app_" + s.id, null);
                   if (saved != null && installed(saved)) return saved;
                   for (String p : s.pkgs) if (installed(p)) return p;
@@ -662,7 +1583,51 @@ jobs:
                   return i;
               }
 
+              private void openIptv(String kind) {
+                  if (!iptv()) {
+                      startActivity(new Intent(this, LoginActivity.class));
+                      return;
+                  }
+                  Intent i = new Intent(this, IptvActivity.class);
+                  i.putExtra(IptvActivity.EXTRA_KIND, kind);
+                  i.putExtra(IptvActivity.EXTRA_QUERY, query());
+                  startActivity(i);
+              }
+
+              private void launchApp(Service s) {
+                  String pkg = resolvePkg(s);
+                  if (pkg == null) {
+                      pickApp(s);
+                      return;
+                  }
+                  if (!startFirst(Collections.singletonList(launchIntent(pkg)))) toast("Couldn't open " + s.name);
+              }
+
+              private void tileOptions(final Service s) {
+                  if (builtIn(s)) {
+                      startActivity(new Intent(this, LoginActivity.class));
+                      return;
+                  }
+                  if (!s.id.equals("live")) {
+                      pickApp(s);
+                      return;
+                  }
+                  String[] opts = {"Open the MUK XC app", "Choose which app Live TV opens", "IPTV login"};
+                  new AlertDialog.Builder(this)
+                      .setTitle("Live TV")
+                      .setItems(opts, (d, w) -> {
+                          if (w == 0) launchApp(s);
+                          else if (w == 1) pickApp(s);
+                          else startActivity(new Intent(this, LoginActivity.class));
+                      })
+                      .setNegativeButton("Cancel", null)
+                      .show();
+              }
+
               private void openService(Service s) {
+                  if (s.id.equals("movies")) { openIptv(Xtream.MOVIE); return; }
+                  if (s.id.equals("series")) { openIptv(Xtream.SERIES); return; }
+                  if (s.id.equals("live") && iptv()) { openIptv(Xtream.LIVE); return; }
                   String pkg = resolvePkg(s);
                   if (pkg == null) {
                       toast(s.name + " app not found. Choose which app to use.");
@@ -703,6 +1668,755 @@ jobs:
 
               private void toast(String msg) {
                   Toast.makeText(this, msg, Toast.LENGTH_LONG).show();
+              }
+          }
+          STREAMHUB_EOF
+          mkdir -p app/src/main/java/com/dil/streamhub
+          cat > app/src/main/java/com/dil/streamhub/PlayerActivity.java <<'STREAMHUB_EOF'
+          package com.dil.streamhub;
+
+          import android.app.Activity;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.graphics.Color;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.view.Gravity;
+          import android.view.KeyEvent;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.view.WindowManager;
+          import android.widget.FrameLayout;
+          import android.widget.TextView;
+
+          import androidx.media3.common.C;
+          import androidx.media3.common.MediaItem;
+          import androidx.media3.common.MimeTypes;
+          import androidx.media3.common.PlaybackException;
+          import androidx.media3.common.Player;
+          import androidx.media3.datasource.DefaultHttpDataSource;
+          import androidx.media3.exoplayer.ExoPlayer;
+          import androidx.media3.exoplayer.source.DefaultMediaSourceFactory;
+          import androidx.media3.extractor.DefaultExtractorsFactory;
+          import androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory;
+          import androidx.media3.ui.PlayerView;
+
+          import java.util.ArrayList;
+
+          /** Full-screen player. Live TV: Up/Down or CH+/CH- change channel. Movies/episodes resume where you left off. */
+          public class PlayerActivity extends Activity {
+
+              public static class Entry {
+                  public final String title, url;
+                  public Entry(String title, String url) { this.title = title; this.url = url; }
+              }
+
+              private static ArrayList<Entry> queue = new ArrayList<>();
+              private static int startIndex;
+              private static boolean startLive;
+
+              public static void start(Context c, ArrayList<Entry> list, int index, boolean live) {
+                  queue = list;
+                  startIndex = index;
+                  startLive = live;
+                  c.startActivity(new Intent(c, PlayerActivity.class));
+              }
+
+              private ExoPlayer player;
+              private PlayerView view;
+              private TextView overlay;
+              private int index;
+              private boolean live;
+              private SharedPreferences resume;
+              private final Handler h = new Handler(Looper.getMainLooper());
+              private final Runnable hideOverlay = () -> {
+                  if (overlay != null) overlay.setVisibility(View.GONE);
+              };
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  if (queue == null || queue.isEmpty()) {
+                      finish();
+                      return;
+                  }
+                  index = savedInstanceState != null ? savedInstanceState.getInt("index", startIndex) : startIndex;
+                  if (index < 0 || index >= queue.size()) index = 0;
+                  live = startLive;
+                  resume = getSharedPreferences("resume", MODE_PRIVATE);
+
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+                      | WindowManager.LayoutParams.FLAG_FULLSCREEN);
+
+                  FrameLayout root = new FrameLayout(this);
+                  root.setBackgroundColor(Color.BLACK);
+
+                  view = new PlayerView(this);
+                  view.setKeepScreenOn(true);
+                  view.setControllerShowTimeoutMs(3500);
+                  root.addView(view, new FrameLayout.LayoutParams(
+                      ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+                  overlay = new TextView(this);
+                  overlay.setTextColor(Color.WHITE);
+                  overlay.setTextSize(20);
+                  overlay.setBackground(Ui.solid(this, 0xCC000000, 12));
+                  int p = Ui.dp(this, 14);
+                  overlay.setPadding(p, p / 2, p, p / 2);
+                  FrameLayout.LayoutParams olp = new FrameLayout.LayoutParams(
+                      ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.START);
+                  olp.setMargins(Ui.dp(this, 32), Ui.dp(this, 24), Ui.dp(this, 32), 0);
+                  root.addView(overlay, olp);
+                  overlay.setVisibility(View.GONE);
+
+                  setContentView(root);
+                  root.setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN
+                      | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                      | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                      | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
+              }
+
+              @Override
+              protected void onStart() {
+                  super.onStart();
+                  if (player == null && queue != null && !queue.isEmpty()) initPlayer();
+              }
+
+              @Override
+              protected void onStop() {
+                  super.onStop();
+                  releasePlayer();
+              }
+
+              @Override
+              protected void onSaveInstanceState(Bundle out) {
+                  super.onSaveInstanceState(out);
+                  out.putInt("index", index);
+              }
+
+              private void initPlayer() {
+                  DefaultHttpDataSource.Factory http = new DefaultHttpDataSource.Factory()
+                      .setUserAgent(Xtream.UA)
+                      .setAllowCrossProtocolRedirects(true)
+                      .setConnectTimeoutMs(15000)
+                      .setReadTimeoutMs(30000);
+                  DefaultExtractorsFactory extractors = new DefaultExtractorsFactory()
+                      .setTsExtractorFlags(DefaultTsPayloadReaderFactory.FLAG_ALLOW_NON_IDR_KEYFRAMES
+                          | DefaultTsPayloadReaderFactory.FLAG_DETECT_ACCESS_UNITS);
+
+                  player = new ExoPlayer.Builder(this)
+                      .setMediaSourceFactory(new DefaultMediaSourceFactory(http, extractors))
+                      .build();
+                  view.setPlayer(player);
+                  player.addListener(new Player.Listener() {
+                      @Override
+                      public void onPlayerError(PlaybackException error) {
+                          if (error.errorCode == PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW) {
+                              player.seekToDefaultPosition();
+                              player.prepare();
+                              return;
+                          }
+                          String what = live ? "this channel" : "this video";
+                          String hint = live && queue.size() > 1 ? "\nPress Up or Down for another channel." : "";
+                          showOverlay("Can't play " + what + " right now." + hint + "\n(" + error.getErrorCodeName() + ")", 10000);
+                      }
+
+                      @Override
+                      public void onPlaybackStateChanged(int state) {
+                          if (state == Player.STATE_ENDED && !live) {
+                              resume.edit().remove(key(queue.get(index))).apply();
+                              if (index + 1 < queue.size()) {
+                                  index++;
+                                  play();
+                              } else {
+                                  finish();
+                              }
+                          }
+                      }
+                  });
+                  play();
+              }
+
+              private static String key(Entry e) {
+                  return "pos_" + e.url.hashCode();
+              }
+
+              private void play() {
+                  Entry e = queue.get(index);
+                  MediaItem.Builder b = new MediaItem.Builder().setUri(e.url);
+                  if (e.url.contains(".m3u8")) b.setMimeType(MimeTypes.APPLICATION_M3U8);
+                  player.setMediaItem(b.build());
+                  if (!live) {
+                      long pos = resume.getLong(key(e), 0);
+                      if (pos > 0) player.seekTo(pos);
+                  }
+                  player.prepare();
+                  player.setPlayWhenReady(true);
+                  String counter = live && queue.size() > 1 ? "     " + (index + 1) + " / " + queue.size() : "";
+                  showOverlay(e.title + counter, 4000);
+              }
+
+              private void savePosition() {
+                  if (player == null || live) return;
+                  Entry e = queue.get(index);
+                  long pos = player.getCurrentPosition();
+                  long dur = player.getDuration();
+                  if (dur != C.TIME_UNSET && pos > 30000 && pos < dur - 120000) {
+                      resume.edit().putLong(key(e), pos).apply();
+                  } else if (dur != C.TIME_UNSET && pos >= dur - 120000) {
+                      resume.edit().remove(key(e)).apply();
+                  }
+              }
+
+              private void releasePlayer() {
+                  if (player == null) return;
+                  savePosition();
+                  view.setPlayer(null);
+                  player.release();
+                  player = null;
+              }
+
+              private void showOverlay(String text, long ms) {
+                  overlay.setText(text);
+                  overlay.setVisibility(View.VISIBLE);
+                  h.removeCallbacks(hideOverlay);
+                  h.postDelayed(hideOverlay, ms);
+              }
+
+              private void switchBy(int d) {
+                  if (player == null || queue.size() < 2) return;
+                  index = (index + d + queue.size()) % queue.size();
+                  play();
+              }
+
+              @Override
+              public boolean dispatchKeyEvent(KeyEvent ev) {
+                  if (live && queue.size() > 1 && ev.getAction() == KeyEvent.ACTION_DOWN) {
+                      int k = ev.getKeyCode();
+                      boolean controls = view != null && view.isControllerFullyVisible();
+                      if (k == KeyEvent.KEYCODE_CHANNEL_UP || (!controls && k == KeyEvent.KEYCODE_DPAD_UP)) {
+                          switchBy(1);
+                          return true;
+                      }
+                      if (k == KeyEvent.KEYCODE_CHANNEL_DOWN || (!controls && k == KeyEvent.KEYCODE_DPAD_DOWN)) {
+                          switchBy(-1);
+                          return true;
+                      }
+                  }
+                  return super.dispatchKeyEvent(ev);
+              }
+          }
+          STREAMHUB_EOF
+          mkdir -p app/src/main/java/com/dil/streamhub
+          cat > app/src/main/java/com/dil/streamhub/Ui.java <<'STREAMHUB_EOF'
+          package com.dil.streamhub;
+
+          import android.app.UiModeManager;
+          import android.content.Context;
+          import android.content.res.Configuration;
+          import android.graphics.Color;
+          import android.graphics.drawable.GradientDrawable;
+          import android.graphics.drawable.StateListDrawable;
+          import android.view.View;
+          import android.widget.Button;
+
+          /** Shared look for all StreamHub screens. */
+          final class Ui {
+              static final int BG = 0xFF0E0E12;
+              static final int SURFACE = 0xFF1C1C24;
+              static final int FIELD = 0xFF22222A;
+              static final int BUTTON = 0xFF2A2A33;
+              static final int ACCENT = 0xFF8E44D0;
+              static final int MUTED = 0xFFA0A0AA;
+              static final int FAINT = 0xFF808088;
+
+              private Ui() {}
+
+              static boolean isTv(Context c) {
+                  UiModeManager ui = (UiModeManager) c.getSystemService(Context.UI_MODE_SERVICE);
+                  return ui != null && ui.getCurrentModeType() == Configuration.UI_MODE_TYPE_TELEVISION;
+              }
+
+              static int dp(Context c, float v) {
+                  return Math.round(v * c.getResources().getDisplayMetrics().density);
+              }
+
+              static StateListDrawable states(Context c, int color, float radiusDp) {
+                  GradientDrawable normal = new GradientDrawable();
+                  normal.setColor(color);
+                  normal.setCornerRadius(dp(c, radiusDp));
+                  GradientDrawable focused = new GradientDrawable();
+                  focused.setColor(color);
+                  focused.setCornerRadius(dp(c, radiusDp));
+                  focused.setStroke(dp(c, 3), Color.WHITE);
+                  StateListDrawable s = new StateListDrawable();
+                  s.addState(new int[]{android.R.attr.state_focused}, focused);
+                  s.addState(new int[]{android.R.attr.state_pressed}, focused);
+                  s.addState(new int[]{}, normal);
+                  return s;
+              }
+
+              static GradientDrawable solid(Context c, int color, float radiusDp) {
+                  GradientDrawable d = new GradientDrawable();
+                  d.setColor(color);
+                  d.setCornerRadius(dp(c, radiusDp));
+                  return d;
+              }
+
+              static void grow(View v, float scale) {
+                  v.setOnFocusChangeListener((view, has) ->
+                      view.animate().scaleX(has ? scale : 1f).scaleY(has ? scale : 1f).setDuration(120).start());
+              }
+
+              static Button button(Context c, String text) {
+                  Button b = new Button(c);
+                  b.setText(text);
+                  b.setAllCaps(false);
+                  b.setTextColor(Color.WHITE);
+                  b.setTextSize(16);
+                  b.setBackground(states(c, BUTTON, 12));
+                  b.setPadding(dp(c, 18), dp(c, 10), dp(c, 18), dp(c, 10));
+                  grow(b, 1.05f);
+                  return b;
+              }
+          }
+          STREAMHUB_EOF
+          mkdir -p app/src/main/java/com/dil/streamhub
+          cat > app/src/main/java/com/dil/streamhub/Xtream.java <<'STREAMHUB_EOF'
+          package com.dil.streamhub;
+
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import android.net.Uri;
+          import android.util.Base64;
+          import android.util.JsonReader;
+          import android.util.JsonToken;
+
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+
+          import java.io.BufferedInputStream;
+          import java.io.ByteArrayOutputStream;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.io.InputStreamReader;
+          import java.net.ConnectException;
+          import java.net.HttpURLConnection;
+          import java.net.SocketTimeoutException;
+          import java.net.URL;
+          import java.net.URLEncoder;
+          import java.net.UnknownHostException;
+          import java.nio.charset.StandardCharsets;
+          import java.text.DateFormat;
+          import java.text.SimpleDateFormat;
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.Date;
+          import java.util.HashMap;
+          import java.util.HashSet;
+          import java.util.Iterator;
+          import java.util.LinkedHashMap;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Map;
+          import java.util.Set;
+
+          /** Talks to an Xtream Codes IPTV server using the subscriber's own login. */
+          public class Xtream {
+
+              public static final String UA = "StreamHub/2.0 (Linux; Android)";
+              public static final String LIVE = "live", MOVIE = "movie", SERIES = "series";
+              private static final String PREFS = "iptv";
+
+              public static class Category {
+                  public final String id, name;
+                  public Category(String id, String name) { this.id = id; this.name = name; }
+              }
+
+              public static class Item {
+                  public String id = "", name = "", icon = "", ext = "", categoryId = "", kind = "", epgId = "";
+
+                  public String key() { return kind + "\t" + id + "\t"; }
+
+                  String serialize() {
+                      return kind + "\t" + id + "\t" + clean(name) + "\t" + clean(icon) + "\t" + clean(ext);
+                  }
+
+                  static Item parse(String s) {
+                      String[] p = s.split("\t", -1);
+                      if (p.length < 5) return null;
+                      Item i = new Item();
+                      i.kind = p[0]; i.id = p[1]; i.name = p[2]; i.icon = p[3]; i.ext = p[4];
+                      return i;
+                  }
+
+                  private static String clean(String s) {
+                      return s == null ? "" : s.replace('\t', ' ').replace('\n', ' ');
+                  }
+              }
+
+              public static class Episode {
+                  public String id = "", title = "", ext = "", season = "1";
+                  public int num;
+              }
+
+              public static class Account {
+                  public boolean ok;
+                  public String status = "", expires = "", maxConn = "", message = "";
+              }
+
+              private static final Map<String, List<Item>> CACHE = Collections.synchronizedMap(new HashMap<String, List<Item>>());
+
+              public final String server, user, pass;
+              public final boolean hls;
+
+              public Xtream(String server, String user, String pass, boolean hls) {
+                  this.server = normalize(server);
+                  this.user = user == null ? "" : user.trim();
+                  this.pass = pass == null ? "" : pass.trim();
+                  this.hls = hls;
+              }
+
+              // ---------- saved login ----------
+
+              private static SharedPreferences prefs(Context c) {
+                  return c.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+              }
+
+              public static Xtream fromPrefs(Context c) {
+                  SharedPreferences p = prefs(c);
+                  String s = p.getString("server", ""), u = p.getString("user", "");
+                  if (s.isEmpty() || u.isEmpty()) return null;
+                  return new Xtream(s, u, p.getString("pass", ""), p.getBoolean("hls", false));
+              }
+
+              public void save(Context c) {
+                  prefs(c).edit().putString("server", server).putString("user", user)
+                      .putString("pass", pass).putBoolean("hls", hls).apply();
+                  CACHE.clear();
+              }
+
+              public static void signOut(Context c) {
+                  prefs(c).edit().remove("server").remove("user").remove("pass").remove("hls").apply();
+                  CACHE.clear();
+              }
+
+              public static String normalize(String s) {
+                  s = s == null ? "" : s.trim();
+                  int q = s.indexOf("/player_api.php");
+                  if (q > 0) s = s.substring(0, q);
+                  q = s.indexOf("/get.php");
+                  if (q > 0) s = s.substring(0, q);
+                  while (s.endsWith("/")) s = s.substring(0, s.length() - 1);
+                  if (!s.isEmpty() && !s.startsWith("http://") && !s.startsWith("https://")) s = "http://" + s;
+                  return s;
+              }
+
+              // ---------- favourites ----------
+
+              private static Set<String> favRaw(Context c) {
+                  return new HashSet<>(prefs(c).getStringSet("favs", new HashSet<String>()));
+              }
+
+              public static Set<String> favKeys(Context c) {
+                  Set<String> out = new HashSet<>();
+                  for (String s : favRaw(c)) {
+                      Item i = Item.parse(s);
+                      if (i != null) out.add(i.key());
+                  }
+                  return out;
+              }
+
+              public static List<Item> favourites(Context c, String kind) {
+                  List<Item> out = new ArrayList<>();
+                  for (String s : favRaw(c)) {
+                      Item i = Item.parse(s);
+                      if (i != null && i.kind.equals(kind)) out.add(i);
+                  }
+                  Collections.sort(out, (a, b) -> a.name.compareToIgnoreCase(b.name));
+                  return out;
+              }
+
+              /** Returns true if the item is now a favourite. */
+              public static boolean toggleFav(Context c, Item item) {
+                  Set<String> s = favRaw(c);
+                  boolean removed = false;
+                  Iterator<String> it = s.iterator();
+                  while (it.hasNext()) {
+                      if (it.next().startsWith(item.key())) { it.remove(); removed = true; }
+                  }
+                  if (!removed) s.add(item.serialize());
+                  prefs(c).edit().putStringSet("favs", s).apply();
+                  return !removed;
+              }
+
+              // ---------- network ----------
+
+              private static String enc(String s) {
+                  try { return URLEncoder.encode(s, "UTF-8"); } catch (Exception e) { return s; }
+              }
+
+              private String apiUrl(String action, String extra) {
+                  StringBuilder b = new StringBuilder(server)
+                      .append("/player_api.php?username=").append(enc(user))
+                      .append("&password=").append(enc(pass));
+                  if (action != null) b.append("&action=").append(action);
+                  if (extra != null) b.append(extra);
+                  return b.toString();
+              }
+
+              private static HttpURLConnection connect(String url) throws IOException {
+                  HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+                  c.setConnectTimeout(15000);
+                  c.setReadTimeout(60000);
+                  c.setRequestProperty("User-Agent", UA);
+                  c.setInstanceFollowRedirects(true);
+                  int code = c.getResponseCode();
+                  if (code >= 400) {
+                      c.disconnect();
+                      throw new IOException("The server answered with error " + code + ".");
+                  }
+                  return c;
+              }
+
+              private static String readAll(String url) throws IOException {
+                  HttpURLConnection c = connect(url);
+                  try {
+                      InputStream in = new BufferedInputStream(c.getInputStream());
+                      ByteArrayOutputStream o = new ByteArrayOutputStream();
+                      byte[] buf = new byte[16384];
+                      int n;
+                      while ((n = in.read(buf)) > 0) o.write(buf, 0, n);
+                      in.close();
+                      return new String(o.toByteArray(), StandardCharsets.UTF_8);
+                  } finally {
+                      c.disconnect();
+                  }
+              }
+
+              public static String friendly(Exception e) {
+                  if (e instanceof UnknownHostException) return "Can't find that server. Check the address.";
+                  if (e instanceof SocketTimeoutException) return "The server took too long to answer. Try again, or check the address and port.";
+                  if (e instanceof ConnectException) return "Couldn't connect. Check the address and the port (for example :8080).";
+                  if (e instanceof javax.net.ssl.SSLException) return "Secure connection failed. Try http:// instead of https://.";
+                  String m = e.getMessage();
+                  return m == null || m.isEmpty() ? "Something went wrong talking to the server." : m;
+              }
+
+              // ---------- API ----------
+
+              public Account login() throws Exception {
+                  Account a = new Account();
+                  String body = readAll(apiUrl(null, null)).trim();
+                  if (!body.startsWith("{")) {
+                      a.message = "Wrong username or password, or this isn't an Xtream Codes server address.";
+                      return a;
+                  }
+                  JSONObject o = new JSONObject(body);
+                  JSONObject ui = o.optJSONObject("user_info");
+                  if (ui == null || ui.optInt("auth", 0) != 1) {
+                      a.message = "Wrong username or password.";
+                      return a;
+                  }
+                  a.status = ui.optString("status", "");
+                  String exp = ui.optString("exp_date", "");
+                  if (!exp.isEmpty() && !exp.equals("null")) {
+                      try {
+                          a.expires = DateFormat.getDateInstance().format(new Date(Long.parseLong(exp) * 1000L));
+                      } catch (Exception ignored) {}
+                  }
+                  a.maxConn = ui.optString("max_connections", "");
+                  a.ok = true;
+                  return a;
+              }
+
+              public List<Category> categories(String kind) throws Exception {
+                  String action = kind.equals(LIVE) ? "get_live_categories"
+                      : kind.equals(MOVIE) ? "get_vod_categories" : "get_series_categories";
+                  String body = readAll(apiUrl(action, null)).trim();
+                  List<Category> out = new ArrayList<>();
+                  if (!body.startsWith("[")) return out;
+                  JSONArray a = new JSONArray(body);
+                  for (int i = 0; i < a.length(); i++) {
+                      JSONObject o = a.optJSONObject(i);
+                      if (o == null) continue;
+                      out.add(new Category(o.optString("category_id", ""), o.optString("category_name", "").trim()));
+                  }
+                  return out;
+              }
+
+              /** categoryId null = everything of this kind. Results are cached for the session. */
+              public List<Item> items(String kind, String categoryId) throws Exception {
+                  String key = kind + "|" + (categoryId == null ? "*" : categoryId);
+                  List<Item> cached = CACHE.get(key);
+                  if (cached != null) return cached;
+
+                  if (categoryId != null) {
+                      List<Item> all = CACHE.get(kind + "|*");
+                      if (all != null) {
+                          List<Item> out = new ArrayList<>();
+                          for (Item i : all) if (categoryId.equals(i.categoryId)) out.add(i);
+                          CACHE.put(key, out);
+                          return out;
+                      }
+                  }
+
+                  String action = kind.equals(LIVE) ? "get_live_streams"
+                      : kind.equals(MOVIE) ? "get_vod_streams" : "get_series";
+                  String extra = categoryId == null ? null : "&category_id=" + enc(categoryId);
+                  HttpURLConnection conn = connect(apiUrl(action, extra));
+                  List<Item> out = new ArrayList<>();
+                  JsonReader r = null;
+                  try {
+                      r = new JsonReader(new InputStreamReader(new BufferedInputStream(conn.getInputStream()), StandardCharsets.UTF_8));
+                      r.setLenient(true);
+                      if (r.peek() != JsonToken.BEGIN_ARRAY) {
+                          r.skipValue();
+                      } else {
+                          r.beginArray();
+                          while (r.hasNext()) {
+                              if (r.peek() != JsonToken.BEGIN_OBJECT) { r.skipValue(); continue; }
+                              Item it = new Item();
+                              it.kind = kind;
+                              r.beginObject();
+                              while (r.hasNext()) {
+                                  String f = r.nextName();
+                                  switch (f) {
+                                      case "name": it.name = str(r).trim(); break;
+                                      case "stream_id":
+                                          if (!kind.equals(SERIES)) it.id = str(r); else r.skipValue();
+                                          break;
+                                      case "series_id":
+                                          if (kind.equals(SERIES)) it.id = str(r); else r.skipValue();
+                                          break;
+                                      case "stream_icon":
+                                      case "cover": {
+                                          String v = str(r);
+                                          if (!v.isEmpty()) it.icon = v;
+                                          break;
+                                      }
+                                      case "category_id": it.categoryId = str(r); break;
+                                      case "container_extension": it.ext = str(r); break;
+                                      case "epg_channel_id": it.epgId = str(r); break;
+                                      default: r.skipValue();
+                                  }
+                              }
+                              r.endObject();
+                              if (!it.id.isEmpty()) out.add(it);
+                          }
+                          r.endArray();
+                      }
+                  } finally {
+                      try { if (r != null) r.close(); } catch (Exception ignored) {}
+                      conn.disconnect();
+                  }
+                  CACHE.put(key, out);
+                  return out;
+              }
+
+              private static String str(JsonReader r) throws IOException {
+                  JsonToken t = r.peek();
+                  switch (t) {
+                      case NULL: r.nextNull(); return "";
+                      case STRING:
+                      case NUMBER: return r.nextString();
+                      case BOOLEAN: return String.valueOf(r.nextBoolean());
+                      default: r.skipValue(); return "";
+                  }
+              }
+
+              private static int num(String s) {
+                  try { return Integer.parseInt(s.trim()); } catch (Exception e) { return 9999; }
+              }
+
+              public LinkedHashMap<String, List<Episode>> seasons(String seriesId) throws Exception {
+                  String body = readAll(apiUrl("get_series_info", "&series_id=" + enc(seriesId))).trim();
+                  LinkedHashMap<String, List<Episode>> out = new LinkedHashMap<>();
+                  if (!body.startsWith("{")) return out;
+                  JSONObject o = new JSONObject(body);
+                  Object eps = o.opt("episodes");
+                  if (eps instanceof JSONObject) {
+                      JSONObject e = (JSONObject) eps;
+                      List<String> keys = new ArrayList<>();
+                      Iterator<String> it = e.keys();
+                      while (it.hasNext()) keys.add(it.next());
+                      Collections.sort(keys, (a, b) -> Integer.compare(num(a), num(b)));
+                      for (String k : keys) addEpisodes(out, k, e.optJSONArray(k));
+                  } else if (eps instanceof JSONArray) {
+                      JSONArray arr = (JSONArray) eps;
+                      for (int i = 0; i < arr.length(); i++) addEpisodes(out, null, arr.optJSONArray(i));
+                  }
+                  for (List<Episode> l : out.values()) Collections.sort(l, (a, b) -> Integer.compare(a.num, b.num));
+                  return out;
+              }
+
+              private static void addEpisodes(Map<String, List<Episode>> out, String seasonKey, JSONArray arr) {
+                  if (arr == null) return;
+                  for (int i = 0; i < arr.length(); i++) {
+                      JSONObject e = arr.optJSONObject(i);
+                      if (e == null) continue;
+                      Episode ep = new Episode();
+                      ep.id = e.optString("id", "");
+                      if (ep.id.isEmpty()) continue;
+                      ep.ext = e.optString("container_extension", "mp4");
+                      ep.num = e.optInt("episode_num", i + 1);
+                      ep.season = seasonKey != null ? seasonKey : e.optString("season", "1");
+                      ep.title = e.optString("title", "");
+                      List<Episode> l = out.get(ep.season);
+                      if (l == null) { l = new ArrayList<>(); out.put(ep.season, l); }
+                      l.add(ep);
+                  }
+              }
+
+              /** "Now: 18:00 News   Next: 18:30 Weather", or "" if the server has no guide. */
+              public String nowNext(String streamId) {
+                  try {
+                      String body = readAll(apiUrl("get_short_epg", "&stream_id=" + enc(streamId) + "&limit=2")).trim();
+                      if (!body.startsWith("{")) return "";
+                      JSONArray l = new JSONObject(body).optJSONArray("epg_listings");
+                      if (l == null || l.length() == 0) return "";
+                      SimpleDateFormat f = new SimpleDateFormat("HH:mm", Locale.getDefault());
+                      StringBuilder b = new StringBuilder();
+                      for (int i = 0; i < Math.min(2, l.length()); i++) {
+                          JSONObject e = l.optJSONObject(i);
+                          if (e == null) continue;
+                          long start = e.optLong("start_timestamp", 0) * 1000L;
+                          b.append(i == 0 ? "Now: " : "     Next: ");
+                          if (start > 0) b.append(f.format(new Date(start))).append("  ");
+                          b.append(b64(e.optString("title", "")));
+                      }
+                      return b.toString();
+                  } catch (Exception e) {
+                      return "";
+                  }
+              }
+
+              private static String b64(String s) {
+                  try {
+                      return new String(Base64.decode(s, Base64.DEFAULT), StandardCharsets.UTF_8).trim();
+                  } catch (Exception e) {
+                      return s;
+                  }
+              }
+
+              // ---------- playback addresses ----------
+
+              private String auth() {
+                  return Uri.encode(user) + "/" + Uri.encode(pass) + "/";
+              }
+
+              public String liveUrl(Item i) {
+                  return server + "/live/" + auth() + i.id + (hls ? ".m3u8" : ".ts");
+              }
+
+              public String movieUrl(Item i) {
+                  return server + "/movie/" + auth() + i.id + "." + (i.ext.isEmpty() ? "mp4" : i.ext);
+              }
+
+              public String episodeUrl(Episode e) {
+                  return server + "/series/" + auth() + e.id + "." + (e.ext.isEmpty() ? "mp4" : e.ext);
               }
           }
           STREAMHUB_EOF
@@ -793,14 +2507,9 @@ jobs:
               <item name="search_box" type="id" />
           </resources>
           STREAMHUB_EOF
-          cat > build.gradle <<'STREAMHUB_EOF'
-          plugins {
-              id 'com.android.application' version '8.7.3' apply false
-          }
-          STREAMHUB_EOF
           cat > gradle.properties <<'STREAMHUB_EOF'
-          org.gradle.jvmargs=-Xmx2g
-          android.useAndroidX=false
+          org.gradle.jvmargs=-Xmx3g
+          android.useAndroidX=true
           STREAMHUB_EOF
           cat > settings.gradle <<'STREAMHUB_EOF'
           pluginManagement {
@@ -814,7 +2523,9 @@ jobs:
           STREAMHUB_EOF
 
       - name: Build the app
-        run: gradle assembleRelease --no-daemon --stacktrace
+        run: |
+          set -o pipefail
+          gradle assembleRelease --no-daemon --stacktrace 2>&1 | tee build-log.txt
 
       - name: Publish StreamHub.apk
         env:
@@ -825,3 +2536,18 @@ jobs:
           sleep 3
           gh release create latest StreamHub.apk --repo "$GITHUB_REPOSITORY" \
             --title "StreamHub" --notes "Install StreamHub.apk on your Fire Stick, Android box or phone."
+
+      - name: Save the error log so it can be checked
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          touch build-log.txt
+          mkdir -p /tmp/logrepo && cd /tmp/logrepo
+          git init -q
+          git config user.name "StreamHub build"
+          git config user.email "build@users.noreply.github.com"
+          grep -nE "error:|FAILED|What went wrong|Exception|e: " "$GITHUB_WORKSPACE/build-log.txt" | head -300 > errors.txt || true
+          tail -c 300000 "$GITHUB_WORKSPACE/build-log.txt" > build-log.txt
+          git add . && git commit -qm "Build log $GITHUB_RUN_NUMBER"
+          git push -q -f "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY.git" HEAD:refs/heads/build-log
