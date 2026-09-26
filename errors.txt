@@ -1,0 +1,5 @@
+8:Build file '/home/runner/work/Streamhub/Streamhub/app/build.gradle' line: 2
+10:* What went wrong:
+22:* Exception is:
+23:org.gradle.api.plugins.UnknownPluginException: Plugin [id: 'com.android.application'] was not found in any of the following sources:
+189:BUILD FAILED in 5s
