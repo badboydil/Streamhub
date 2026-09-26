@@ -1103,6 +1103,8 @@ jobs:
                       new String[]{"com.nathnetwork.xciptv"}),
                   new Service("movies", "Movies", 0xFFB5651D, Color.WHITE, new String[0]),
                   new Service("series", "Series", 0xFF00796B, Color.WHITE, new String[0]),
+                  new Service("kodi", "Kodi", 0xFF1F3A5F, 0xFF4FC3F7,
+                      new String[]{"org.xbmc.kodi", "org.xbmc.kodi.beta"}),
               };
 
               private static boolean builtIn(Service s) {
@@ -1206,7 +1208,7 @@ jobs:
                   root.addView(title);
 
                   TextView sub = new TextView(this);
-                  sub.setText("Netflix, Prime Video, YouTube, Live TV, Movies and Series in one place");
+                  sub.setText("Netflix, Prime Video, YouTube, Live TV, Movies, Series and Kodi in one place");
                   sub.setTextColor(0xFFA0A0AA);
                   sub.setTextSize(15);
                   sub.setPadding(0, dp(2), 0, dp(18));
@@ -2506,6 +2508,11 @@ jobs:
           <resources>
               <item name="search_box" type="id" />
           </resources>
+          STREAMHUB_EOF
+          cat > build.gradle <<'STREAMHUB_EOF'
+          plugins {
+              id 'com.android.application' version '8.7.3' apply false
+          }
           STREAMHUB_EOF
           cat > gradle.properties <<'STREAMHUB_EOF'
           org.gradle.jvmargs=-Xmx3g
