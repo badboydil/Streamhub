@@ -37,8 +37,8 @@ jobs:
                   applicationId 'com.dil.streamhub'
                   minSdk 22
                   targetSdk 34
-                  versionCode 2
-                  versionName '2.0'
+                  versionCode 3
+                  versionName '3.0'
               }
               signingConfigs {
                   hub {
@@ -68,6 +68,7 @@ jobs:
               implementation platform('org.jetbrains.kotlin:kotlin-bom:1.8.22')
               implementation 'androidx.media3:media3-exoplayer:1.4.1'
               implementation 'androidx.media3:media3-exoplayer-hls:1.4.1'
+              implementation 'androidx.media3:media3-exoplayer-dash:1.4.1'
               implementation 'androidx.media3:media3-extractor:1.4.1'
               implementation 'androidx.media3:media3-ui:1.4.1'
           }
@@ -165,6 +166,133 @@ jobs:
                       android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
               </application>
           </manifest>
+          STREAMHUB_EOF
+          mkdir -p app/src/main/java/com/dil/streamhub
+          cat > app/src/main/java/com/dil/streamhub/ChannelCheck.java <<'STREAMHUB_EOF'
+          package com.dil.streamhub;
+
+          import android.content.Context;
+          import android.content.SharedPreferences;
+
+          import java.io.InputStream;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.nio.charset.StandardCharsets;
+          import java.util.List;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+          import java.util.concurrent.atomic.AtomicBoolean;
+
+          /**
+           * Tests free channels from the viewer's own connection and remembers the answer,
+           * so lists only show channels that are working right now.
+           */
+          final class ChannelCheck {
+
+              interface Listener {
+                  /** Called on a background thread for each channel as its test finishes. */
+                  void onResult(Xtream.Item item, boolean works);
+              }
+
+              private static final long GOOD_FOR_MS = 12L * 60 * 60 * 1000;  // trust a pass for 12 hours
+              private static final long BAD_FOR_MS = 6L * 60 * 60 * 1000;    // retry a failure after 6 hours
+              private static final ExecutorService POOL = Executors.newFixedThreadPool(16);
+
+              private ChannelCheck() {}
+
+              private static SharedPreferences prefs(Context c) {
+                  return c.getSharedPreferences("health", Context.MODE_PRIVATE);
+              }
+
+              private static String key(Xtream.Item i) {
+                  return "h" + i.id.hashCode();
+              }
+
+              /** 1 = works, -1 = doesn't work, 0 = not tested recently. */
+              static int known(Context c, Xtream.Item i) {
+                  long v = prefs(c).getLong(key(i), 0);
+                  if (v == 0) return 0;
+                  long age = System.currentTimeMillis() - Math.abs(v);
+                  if (v > 0) return age < GOOD_FOR_MS ? 1 : 0;
+                  return age < BAD_FOR_MS ? -1 : 0;
+              }
+
+              static void mark(Context c, Xtream.Item i, boolean works) {
+                  long now = System.currentTimeMillis();
+                  prefs(c).edit().putLong(key(i), works ? now : -now).apply();
+              }
+
+              static void markUrl(Context c, String url, boolean works) {
+                  Xtream.Item i = new Xtream.Item();
+                  i.id = url;
+                  mark(c, i, works);
+              }
+
+              /** Tests every item not already known. Returns a flag that cancels the remaining tests when set. */
+              static AtomicBoolean checkAll(final Context c, List<Xtream.Item> items, final Listener l) {
+                  final AtomicBoolean cancelled = new AtomicBoolean(false);
+                  final Context app = c.getApplicationContext();
+                  for (final Xtream.Item it : items) {
+                      POOL.execute(() -> {
+                          if (cancelled.get()) return;
+                          boolean ok = probe(it.id, it.ua, it.ref, 0);
+                          mark(app, it, ok);
+                          if (!cancelled.get()) l.onResult(it, ok);
+                      });
+                  }
+                  return cancelled;
+              }
+
+              /** A channel "works" if the server answers with a playlist or video data within a few seconds. */
+              static boolean probe(String url, String ua, String ref, int redirects) {
+                  HttpURLConnection c = null;
+                  try {
+                      c = (HttpURLConnection) new URL(url).openConnection();
+                      c.setConnectTimeout(6000);
+                      c.setReadTimeout(7000);
+                      c.setInstanceFollowRedirects(false);
+                      c.setRequestProperty("User-Agent", ua == null || ua.isEmpty() ? Xtream.UA : ua);
+                      if (ref != null && !ref.isEmpty()) c.setRequestProperty("Referer", ref);
+                      int code = c.getResponseCode();
+                      if (code >= 300 && code < 400) {
+                          String loc = c.getHeaderField("Location");
+                          if (loc == null || redirects >= 4) return false;
+                          String next = new URL(new URL(url), loc).toString();
+                          c.disconnect();
+                          c = null;
+                          return probe(next, ua, ref, redirects + 1);
+                      }
+                      if (code < 200 || code >= 300) return false;
+
+                      InputStream in = c.getInputStream();
+                      byte[] buf = new byte[2048];
+                      int total = 0, n;
+                      while (total < buf.length && (n = in.read(buf, total, buf.length - total)) > 0) total += n;
+                      in.close();
+                      if (total <= 0) return false;
+
+                      String head = new String(buf, 0, total, StandardCharsets.UTF_8).trim();
+                      if (head.startsWith("#EXTM3U")) {
+                          // A playlist must list at least one stream or segment to be playable.
+                          for (String line : head.split("\n")) {
+                              String t = line.trim();
+                              if (!t.isEmpty() && !t.startsWith("#")) return true;
+                              if (t.startsWith("#EXT-X-STREAM-INF") || t.startsWith("#EXTINF")) return true;
+                          }
+                          return false;
+                      }
+                      if (head.startsWith("<")) {
+                          // An HTML error page, unless it's a DASH manifest.
+                          return head.contains("<MPD") || head.contains("urn:mpeg:dash");
+                      }
+                      return true; // video data (MPEG-TS, MP4, etc.)
+                  } catch (Throwable t) {
+                      return false;
+                  } finally {
+                      if (c != null) c.disconnect();
+                  }
+              }
+          }
           STREAMHUB_EOF
           mkdir -p app/src/main/java/com/dil/streamhub
           cat > app/src/main/java/com/dil/streamhub/ImageLoader.java <<'STREAMHUB_EOF'
@@ -301,12 +429,16 @@ jobs:
           import java.util.Set;
           import java.util.concurrent.ExecutorService;
           import java.util.concurrent.Executors;
+          import java.util.concurrent.atomic.AtomicBoolean;
+          import android.widget.Button;
 
           /** Browse and search the subscriber's live channels, movies or series. */
           public class IptvActivity extends Activity {
 
               public static final String EXTRA_KIND = "kind";
               public static final String EXTRA_QUERY = "query";
+              public static final String EXTRA_CATEGORY = "category";
+              public static final String WORLD = "world";
 
               private static final String FAV = "\u0001fav";
               private static final String ALL = "\u0001all";
@@ -325,6 +457,9 @@ jobs:
               private String currentCat = null;
               private int loadToken = 0;
               private boolean suppressSearch = false;
+              private AtomicBoolean checkRun;
+              private boolean showAll = false;
+              private Button filterBtn;
 
               private ListView catList, itemList;
               private TextView status, info;
@@ -337,14 +472,14 @@ jobs:
               @Override
               protected void onCreate(Bundle savedInstanceState) {
                   super.onCreate(savedInstanceState);
+                  kind = getIntent().getStringExtra(EXTRA_KIND);
+                  if (kind == null) kind = Xtream.LIVE;
                   x = Xtream.fromPrefs(this);
-                  if (x == null) {
+                  if (x == null && !world()) {
                       startActivity(new Intent(this, LoginActivity.class));
                       finish();
                       return;
                   }
-                  kind = getIntent().getStringExtra(EXTRA_KIND);
-                  if (kind == null) kind = Xtream.LIVE;
                   tv = Ui.isTv(this);
                   favKeys = Xtream.favKeys(this);
                   buildUi();
@@ -359,11 +494,36 @@ jobs:
               @Override
               protected void onDestroy() {
                   super.onDestroy();
+                  if (checkRun != null) checkRun.set(true);
                   main.removeCallbacksAndMessages(null);
+              }
+
+              private boolean world() {
+                  return WORLD.equals(kind);
+              }
+
+              private boolean channels() {
+                  return world() || Xtream.LIVE.equals(kind);
+              }
+
+              // ---------- data source: IPTV login or free World TV list ----------
+
+              private List<Xtream.Category> srcCategories() throws Exception {
+                  return world() ? WorldTv.categories() : x.categories(kind);
+              }
+
+              private List<Xtream.Item> srcItems(String categoryId) throws Exception {
+                  return world() ? WorldTv.items(categoryId) : x.items(kind, categoryId);
+              }
+
+              private PlayerActivity.Entry entry(Xtream.Item i) {
+                  if (world()) return new PlayerActivity.Entry(i.name, i.id, i.ua, i.ref);
+                  return new PlayerActivity.Entry(i.name, kind.equals(Xtream.LIVE) ? x.liveUrl(i) : x.movieUrl(i));
               }
 
               private String kindWord(boolean plural) {
                   switch (kind) {
+                      case WORLD:
                       case Xtream.LIVE: return plural ? "channels" : "channel";
                       case Xtream.MOVIE: return plural ? "movies" : "movie";
                       default: return plural ? "series" : "series";
@@ -389,7 +549,7 @@ jobs:
                       ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
                   TextView title = new TextView(this);
-                  title.setText(kind.equals(Xtream.LIVE) ? "Live TV" : kind.equals(Xtream.MOVIE) ? "Movies" : "Series");
+                  title.setText(world() ? "World TV" : kind.equals(Xtream.LIVE) ? "Live TV" : kind.equals(Xtream.MOVIE) ? "Movies" : "Series");
                   title.setTextColor(Color.WHITE);
                   title.setTextSize(tv ? 28 : 22);
                   title.setTypeface(Typeface.DEFAULT_BOLD);
@@ -406,6 +566,21 @@ jobs:
                   search.setBackground(Ui.states(this, Ui.FIELD, 10));
                   search.setPadding(Ui.dp(this, 14), Ui.dp(this, 8), Ui.dp(this, 14), Ui.dp(this, 8));
                   top.addView(search, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+                  if (world()) {
+                      filterBtn = Ui.button(this, "Working only");
+                      LinearLayout.LayoutParams fl = new LinearLayout.LayoutParams(
+                          ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                      fl.leftMargin = Ui.dp(this, 10);
+                      top.addView(filterBtn, fl);
+                      filterBtn.setOnClickListener(v -> {
+                          showAll = !showAll;
+                          filterBtn.setText(showAll ? "Showing all" : "Working only");
+                          String q = search.getText().toString().trim();
+                          if (!q.isEmpty()) runSearch(q);
+                          else if (currentCat != null) showCategory(currentCat);
+                      });
+                  }
 
                   status = new TextView(this);
                   status.setTextColor(Ui.MUTED);
@@ -455,6 +630,8 @@ jobs:
                   info.setPadding(0, Ui.dp(this, 10), 0, 0);
                   info.setText(kind.equals(Xtream.SERIES)
                       ? "Pick a series to see its seasons and episodes. Hold OK on one to add it to Favourites."
+                      : world()
+                      ? "Free channels that broadcasters publish online. Some may be offline or only work in their own country; press Up/Down while watching to skip. Hold OK on a channel to add it to Favourites."
                       : "Hold OK (or long-press) on a " + kindWord(false)
                         + " to add it to Favourites or play it in another app.");
                   root.addView(info);
@@ -490,7 +667,20 @@ jobs:
                       itemOptions(pos);
                       return true;
                   });
-                  if (kind.equals(Xtream.LIVE)) {
+                  if (world()) {
+                      itemList.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+                          @Override
+                          public void onItemSelected(AdapterView<?> parent, View view, int pos, long id) {
+                              if (pos < shown.size()) {
+                                  Xtream.Item it = shown.get(pos);
+                                  info.setText(it.categoryId.isEmpty() ? it.name : it.name + "\n" + it.categoryId);
+                              }
+                          }
+
+                          @Override
+                          public void onNothingSelected(AdapterView<?> parent) {}
+                      });
+                  } else if (kind.equals(Xtream.LIVE)) {
                       itemList.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
                           @Override
                           public void onItemSelected(AdapterView<?> parent, View view, int pos, long id) {
@@ -557,16 +747,19 @@ jobs:
                   setStatus("Loading categories…");
                   bg.execute(() -> {
                       try {
-                          final List<Xtream.Category> list = x.categories(kind);
+                          final List<Xtream.Category> list = srcCategories();
                           main.post(() -> {
                               cats.clear();
                               cats.add(new Xtream.Category(FAV, "★ Favourites"));
-                              cats.add(new Xtream.Category(ALL, "All " + kindWord(true)));
+                              if (!world()) cats.add(new Xtream.Category(ALL, "All " + kindWord(true)));
                               cats.addAll(list);
                               catAdapter.notifyDataSetChanged();
                               if (currentCat == null && search.getText().length() == 0) {
                                   String first;
-                                  if (!Xtream.favourites(this, kind).isEmpty()) first = FAV;
+                                  String wanted = getIntent().getStringExtra(EXTRA_CATEGORY);
+                                  if (wanted != null && indexOfCatOrMinus(wanted) >= 0) first = wanted;
+                                  else if (!Xtream.favourites(this, kind).isEmpty()) first = FAV;
+                                  else if (world() && indexOfCatOrMinus(WorldTv.HOME_COUNTRY) >= 0) first = WorldTv.HOME_COUNTRY;
                                   else if (list.isEmpty()) first = ALL;
                                   else first = list.get(0).id;
                                   showCategory(first);
@@ -574,9 +767,15 @@ jobs:
                               }
                           });
                       } catch (final Exception e) {
-                          main.post(() -> setStatus(Xtream.friendly(e) + "  Hold OK on the Live TV tile to check your IPTV login."));
+                          main.post(() -> setStatus(world() ? Xtream.friendly(e)
+                              : Xtream.friendly(e) + "  Hold OK on the Live TV tile to check your IPTV login."));
                       }
                   });
+              }
+
+              private int indexOfCatOrMinus(String id) {
+                  for (int i = 0; i < cats.size(); i++) if (cats.get(i).id.equals(id)) return i;
+                  return -1;
               }
 
               private int indexOfCat(String id) {
@@ -589,8 +788,63 @@ jobs:
                   return "";
               }
 
+              /** World TV: show channels that recently worked straight away, test the rest and add them as they pass. */
+              private void presentWorld(final List<Xtream.Item> items, final String label) {
+                  if (checkRun != null) checkRun.set(true);
+                  checkRun = null;
+                  if (showAll) {
+                      setItems(items);
+                      setStatus(label + " \u00B7 " + items.size() + " channels, including ones that may not work");
+                      return;
+                  }
+                  final ArrayList<Xtream.Item> good = new ArrayList<>();
+                  final ArrayList<Xtream.Item> unknown = new ArrayList<>();
+                  int bad = 0;
+                  for (Xtream.Item i : items) {
+                      int k = ChannelCheck.known(this, i);
+                      if (k > 0) good.add(i);
+                      else if (k == 0) unknown.add(i);
+                      else bad++;
+                  }
+                  setItems(good);
+                  if (unknown.isEmpty()) {
+                      worldDone(label, good.size(), bad);
+                      return;
+                  }
+                  final int token = loadToken;
+                  final int total = unknown.size();
+                  final int[] counts = {0, bad};
+                  setStatus(label + " \u00B7 checking which channels work\u2026 0 of " + total);
+                  checkRun = ChannelCheck.checkAll(this, unknown, (it, ok) -> main.post(() -> {
+                      if (token != loadToken) return;
+                      counts[0]++;
+                      if (ok) {
+                          good.add(it);
+                          itemAdapter.notifyDataSetChanged();
+                      } else {
+                          counts[1]++;
+                      }
+                      if (counts[0] >= total) {
+                          worldDone(label, good.size(), counts[1]);
+                      } else {
+                          setStatus(label + " \u00B7 checking which channels work\u2026 " + counts[0] + " of " + total
+                              + " \u00B7 " + good.size() + " working so far");
+                      }
+                  }));
+              }
+
+              private void worldDone(String label, int good, int hidden) {
+                  if (good == 0) {
+                      setStatus(label + " \u00B7 none of these channels are working right now.");
+                      return;
+                  }
+                  setStatus(label + " \u00B7 " + good + " working " + (good == 1 ? "channel" : "channels")
+                      + (hidden > 0 ? " \u00B7 " + hidden + " hidden because they're not working right now" : ""));
+              }
+
               private void showCategory(final String catId) {
                   currentCat = catId;
+                  if (checkRun != null) { checkRun.set(true); checkRun = null; }
                   catAdapter.notifyDataSetChanged();
                   final int token = ++loadToken;
                   if (FAV.equals(catId)) {
@@ -604,11 +858,15 @@ jobs:
                   setStatus("Loading " + catName(catId) + "…");
                   bg.execute(() -> {
                       try {
-                          final List<Xtream.Item> items = x.items(kind, ALL.equals(catId) ? null : catId);
+                          final List<Xtream.Item> items = srcItems(ALL.equals(catId) ? null : catId);
                           main.post(() -> {
                               if (token != loadToken) return;
+                              if (world()) {
+                                  presentWorld(items, catName(catId));
+                                  return;
+                              }
                               setItems(items);
-                              setStatus(catName(catId) + " · " + items.size() + " " + kindWord(items.size() != 1));
+                              setStatus(catName(catId) + " \u00B7 " + items.size() + " " + kindWord(items.size() != 1));
                           });
                       } catch (final Exception e) {
                           main.post(() -> {
@@ -629,14 +887,19 @@ jobs:
                   setStatus("Searching all " + kindWord(true) + " for “" + q + "”… (the first search takes a moment)");
                   bg.execute(() -> {
                       try {
-                          List<Xtream.Item> all = x.items(kind, null);
+                          List<Xtream.Item> all = srcItems(null);
                           String ql = q.toLowerCase(Locale.ROOT);
                           final List<Xtream.Item> out = new ArrayList<>();
                           for (Xtream.Item i : all) {
                               if (i.name.toLowerCase(Locale.ROOT).contains(ql)) out.add(i);
+                              if (world() && out.size() >= 300) break;
                           }
                           main.post(() -> {
                               if (token != loadToken) return;
+                              if (world()) {
+                                  presentWorld(out, "\u201C" + q + "\u201D");
+                                  return;
+                              }
                               setItems(out);
                               setStatus(out.isEmpty()
                                   ? "No " + kindWord(true) + " match “" + q + "”."
@@ -655,13 +918,13 @@ jobs:
               private void openItem(int pos) {
                   if (pos < 0 || pos >= shown.size()) return;
                   Xtream.Item it = shown.get(pos);
-                  if (kind.equals(Xtream.LIVE)) {
+                  if (channels()) {
                       ArrayList<PlayerActivity.Entry> list = new ArrayList<>();
-                      for (Xtream.Item i : shown) list.add(new PlayerActivity.Entry(i.name, x.liveUrl(i)));
-                      PlayerActivity.start(this, list, pos, true);
+                      for (Xtream.Item i : shown) list.add(entry(i));
+                      PlayerActivity.start(this, list, pos, true, world());
                   } else if (kind.equals(Xtream.MOVIE)) {
                       ArrayList<PlayerActivity.Entry> list = new ArrayList<>();
-                      list.add(new PlayerActivity.Entry(it.name, x.movieUrl(it)));
+                      list.add(entry(it));
                       PlayerActivity.start(this, list, 0, false);
                   } else {
                       openSeries(it);
@@ -751,7 +1014,7 @@ jobs:
               }
 
               private void playExternal(Xtream.Item it) {
-                  String url = kind.equals(Xtream.LIVE) ? x.liveUrl(it) : x.movieUrl(it);
+                  String url = entry(it).url;
                   Intent i = new Intent(Intent.ACTION_VIEW);
                   i.setDataAndType(Uri.parse(url), "video/*");
                   i.putExtra("title", it.name);
@@ -800,7 +1063,7 @@ jobs:
                       LinearLayout row;
                       ImageView img;
                       TextView name;
-                      boolean live = kind.equals(Xtream.LIVE);
+                      boolean live = channels();
                       int w = live ? Ui.dp(IptvActivity.this, tv ? 72 : 60) : Ui.dp(IptvActivity.this, tv ? 54 : 44);
                       int h = live ? Ui.dp(IptvActivity.this, tv ? 44 : 36) : Ui.dp(IptvActivity.this, tv ? 80 : 66);
                       if (convert instanceof LinearLayout) {
@@ -1079,9 +1342,16 @@ jobs:
                   final String id, name;
                   final int bg, fg;
                   final String[] pkgs;
+                  final String[] keywords;   // matched against installed app names when the package isn't known
+                  final String storeName;    // what to search for in the app store if it isn't installed
 
                   Service(String id, String name, int bg, int fg, String[] pkgs) {
+                      this(id, name, bg, fg, pkgs, new String[0], null);
+                  }
+
+                  Service(String id, String name, int bg, int fg, String[] pkgs, String[] keywords, String storeName) {
                       this.id = id; this.name = name; this.bg = bg; this.fg = fg; this.pkgs = pkgs;
+                      this.keywords = keywords; this.storeName = storeName;
                   }
               }
 
@@ -1092,24 +1362,61 @@ jobs:
 
               private static final Service[] SERVICES = {
                   new Service("netflix", "Netflix", 0xFF141414, 0xFFE50914,
-                      new String[]{"com.netflix.ninja", "com.netflix.mediaclient"}),
+                      new String[]{"com.netflix.ninja", "com.netflix.mediaclient"},
+                      new String[]{"netflix"}, "Netflix"),
                   new Service("prime", "Prime Video", 0xFF00A8E1, Color.WHITE,
                       new String[]{"com.amazon.firebat", "com.amazon.amazonvideo.livingroom",
-                          "com.amazon.avod.thirdpartyclient", "com.amazon.avod"}),
+                          "com.amazon.avod.thirdpartyclient", "com.amazon.avod"},
+                      new String[]{"prime video"}, "Prime Video"),
                   new Service("youtube", "YouTube", 0xFFFF0033, Color.WHITE,
                       new String[]{"com.google.android.youtube.tv", "com.amazon.firetv.youtube",
-                          "com.google.android.youtube"}),
+                          "com.google.android.youtube"},
+                      new String[]{"youtube"}, "YouTube"),
+                  new Service("showmax", "Showmax", 0xFF16122B, 0xFFFF3D7F,
+                      new String[]{"com.showmax.app"}, new String[]{"showmax"}, "Showmax"),
+                  new Service("dstv", "DStv", 0xFF0A3D91, Color.WHITE,
+                      new String[]{"com.dstv.now.android"}, new String[]{"dstv"}, "DStv"),
+                  new Service("sabc", "SABC+", 0xFF0B6E4F, Color.WHITE,
+                      new String[0], new String[]{"sabc"}, "SABC+"),
+                  new Service("world", "World TV", 0xFFB86A00, Color.WHITE, new String[0]),
+                  new Service("sports", "Sports", 0xFF1E7B34, Color.WHITE, new String[0]),
                   new Service("live", "Live TV", 0xFF6A1B9A, Color.WHITE,
                       new String[]{"com.nathnetwork.xciptv"}),
+                  new Service("kodi", "Kodi", 0xFF1F3A5F, 0xFF4FC3F7,
+                      new String[]{"org.xbmc.kodi", "org.xbmc.kodi.beta"}, new String[]{"kodi"}, "Kodi"),
                   new Service("movies", "Movies", 0xFFB5651D, Color.WHITE, new String[0]),
                   new Service("series", "Series", 0xFF00796B, Color.WHITE, new String[0]),
-                  new Service("kodi", "Kodi", 0xFF1F3A5F, 0xFF4FC3F7,
-                      new String[]{"org.xbmc.kodi", "org.xbmc.kodi.beta"}),
+              };
+
+              /** Free and official sports apps offered from the Sports tile. */
+              private static final Service[] SPORTS_APPS = {
+                  new Service("sabc", "SABC+ \u00B7 SABC Sport and free SA channels", 0, 0,
+                      new String[0], new String[]{"sabc"}, "SABC+"),
+                  new Service("ssschools", "SuperSport Schools \u00B7 free school sport", 0, 0,
+                      new String[0], new String[]{"supersport schools"}, "SuperSport Schools"),
+                  new Service("fifa", "FIFA+ \u00B7 free football matches and shows", 0, 0,
+                      new String[0], new String[]{"fifa"}, "FIFA+"),
+                  new Service("redbull", "Red Bull TV \u00B7 free extreme and motor sport", 0, 0,
+                      new String[]{"com.nousguide.android.rbtv"}, new String[]{"red bull"}, "Red Bull TV"),
+                  new Service("onefootball", "OneFootball \u00B7 free matches where available", 0, 0,
+                      new String[]{"de.motain.iliga"}, new String[]{"onefootball"}, "OneFootball"),
+                  new Service("olympics", "Olympics \u00B7 free Olympic sport", 0, 0,
+                      new String[0], new String[]{"olympics"}, "Olympics"),
+                  new Service("dstv", "DStv \u00B7 SuperSport (subscription)", 0, 0,
+                      new String[]{"com.dstv.now.android"}, new String[]{"dstv"}, "DStv"),
               };
 
               private static boolean builtIn(Service s) {
-                  return s.id.equals("movies") || s.id.equals("series");
+                  return s.id.equals("movies") || s.id.equals("series") || s.id.equals("world") || s.id.equals("sports");
               }
+
+              private static Service service(String id) {
+                  for (Service s : SERVICES) if (s.id.equals(id)) return s;
+                  return null;
+              }
+
+              private final List<Service> visible = new ArrayList<>();
+              private boolean shownWithIptv;
 
               private boolean iptv() {
                   return Xtream.fromPrefs(this) != null;
@@ -1138,6 +1445,7 @@ jobs:
               @Override
               protected void onResume() {
                   super.onResume();
+                  if (iptv() != shownWithIptv) buildTiles();
                   refreshTiles();
               }
 
@@ -1208,7 +1516,7 @@ jobs:
                   root.addView(title);
 
                   TextView sub = new TextView(this);
-                  sub.setText("Netflix, Prime Video, YouTube, Live TV, Movies, Series and Kodi in one place");
+                  sub.setText("Your streaming apps, free world TV and sport in one place");
                   sub.setTextColor(0xFFA0A0AA);
                   sub.setTextSize(15);
                   sub.setPadding(0, dp(2), 0, dp(18));
@@ -1286,13 +1594,6 @@ jobs:
                   root.addView(hs);
                   rebuildList();
 
-                  Button iptvBtn = smallButton("IPTV login");
-                  iptvBtn.setOnClickListener(v -> startActivity(new Intent(this, LoginActivity.class)));
-                  LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(
-                      ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-                  ilp.topMargin = dp(18);
-                  root.addView(iptvBtn, ilp);
-
                   TextView tip = new TextView(this);
                   tip.setText("Tips: type a title, then pick a tile to search there.  "
                       + "Hold OK (or long-press) on a tile for more options.  "
@@ -1313,12 +1614,19 @@ jobs:
                   tiles.clear();
                   tileStatus.clear();
 
+                  shownWithIptv = iptv();
+                  visible.clear();
+                  for (Service sv : SERVICES) {
+                      boolean iptvOnly = sv.id.equals("movies") || sv.id.equals("series");
+                      if (!iptvOnly || shownWithIptv) visible.add(sv);
+                  }
+
                   boolean wide = getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE;
-                  int cols = wide ? 3 : 2;
-                  int height = tv ? dp(140) : dp(115);
+                  int cols = wide ? (tv ? 5 : 4) : 2;
+                  int height = tv ? dp(118) : dp(105);
 
                   LinearLayout row = null;
-                  for (int i = 0; i < SERVICES.length; i++) {
+                  for (int i = 0; i < visible.size(); i++) {
                       if (i % cols == 0) {
                           row = new LinearLayout(this);
                           row.setOrientation(LinearLayout.HORIZONTAL);
@@ -1326,7 +1634,7 @@ jobs:
                           tileArea.addView(row, new LinearLayout.LayoutParams(
                               ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
                       }
-                      final Service s = SERVICES[i];
+                      final Service s = visible.get(i);
 
                       LinearLayout tile = new LinearLayout(this);
                       tile.setOrientation(LinearLayout.VERTICAL);
@@ -1340,7 +1648,7 @@ jobs:
                       TextView name = new TextView(this);
                       name.setText(s.name);
                       name.setTextColor(s.fg);
-                      name.setTextSize(tv ? 28 : 22);
+                      name.setTextSize(tv ? 24 : 21);
                       name.setTypeface(Typeface.DEFAULT_BOLD);
                       name.setGravity(Gravity.CENTER);
                       tile.addView(name);
@@ -1363,7 +1671,7 @@ jobs:
                       tileStatus.add(status);
                   }
                   // pad an incomplete last row so tiles keep the same width
-                  int rem = SERVICES.length % cols;
+                  int rem = visible.size() % cols;
                   if (rem != 0 && row != null) {
                       for (int i = rem; i < cols; i++) {
                           View spacer = new View(this);
@@ -1378,9 +1686,17 @@ jobs:
                   if (search == null) return;
                   String q = query();
                   boolean loggedIn = iptv();
-                  for (int i = 0; i < SERVICES.length && i < tileStatus.size(); i++) {
-                      Service s = SERVICES[i];
+                  for (int i = 0; i < visible.size() && i < tileStatus.size(); i++) {
+                      Service s = visible.get(i);
                       String text;
+                      if (s.id.equals("world")) {
+                          tileStatus.get(i).setText(q.isEmpty() ? "Free channels worldwide" : "Find \u201C" + q + "\u201D");
+                          continue;
+                      }
+                      if (s.id.equals("sports")) {
+                          tileStatus.get(i).setText("Free & live sport");
+                          continue;
+                      }
                       if (builtIn(s)) {
                           text = !loggedIn ? "Set up IPTV login" : q.isEmpty() ? "Browse" : "Search \u201C" + q + "\u201D";
                           tileStatus.get(i).setText(text);
@@ -1393,7 +1709,7 @@ jobs:
                       }
                       String pkg = resolvePkg(s);
                       if (pkg == null) {
-                          text = "Not found – hold OK to choose the app";
+                          text = s.storeName != null ? "Not installed \u2013 press OK to get it" : "Not found \u2013 hold OK to choose the app";
                       } else if (q.isEmpty() || s.id.equals("live")) {
                           text = "Open";
                       } else {
@@ -1514,8 +1830,19 @@ jobs:
                   return apps;
               }
 
+              private String findByName(String[] words) {
+                  if (words.length == 0) return null;
+                  List<AppEntry> apps = launchableApps();
+                  for (String w : words) {
+                      for (AppEntry a : apps) {
+                          if (a.label.toLowerCase(Locale.ROOT).contains(w)) return a.pkg;
+                      }
+                  }
+                  return null;
+              }
+
               private String findLiveTvApp() {
-                  for (String p : SERVICES[3].pkgs) if (installed(p)) return p;
+                  for (String p : service("live").pkgs) if (installed(p)) return p;
                   List<AppEntry> apps = launchableApps();
                   String[] words = {"muk", "xc", "iptv", "smarters", "tivimate"};
                   for (String w : words) {
@@ -1534,7 +1861,61 @@ jobs:
                   if (saved != null && installed(saved)) return saved;
                   for (String p : s.pkgs) if (installed(p)) return p;
                   if (s.id.equals("live")) return findLiveTvApp();
-                  return null;
+                  return findByName(s.keywords);
+              }
+
+              /** Opens the app store on this device (Amazon on Fire TV, Google Play elsewhere) searching for the app. */
+              private void openStore(String name) {
+                  List<Intent> tries = new ArrayList<>();
+                  tries.add(new Intent(Intent.ACTION_VIEW, Uri.parse("amzn://apps/android?s=" + enc(name))));
+                  tries.add(new Intent(Intent.ACTION_VIEW, Uri.parse("market://search?q=" + enc(name) + "&c=apps")));
+                  tries.add(new Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/search?q=" + enc(name) + "&c=apps")));
+                  if (!startFirst(tries)) toast("Couldn't open the app store. Search for \u201C" + name + "\u201D there yourself.");
+              }
+
+              private void offerInstall(final Service s) {
+                  String[] opts = {"Get " + s.storeName + " from the app store", "Choose an app that's already installed"};
+                  new AlertDialog.Builder(this)
+                      .setTitle(s.storeName + " isn't installed on this device")
+                      .setItems(opts, (d, w) -> {
+                          if (w == 0) openStore(s.storeName);
+                          else pickApp(s);
+                      })
+                      .setNegativeButton("Cancel", null)
+                      .show();
+              }
+
+              private void launchOrInstall(Service s) {
+                  String pkg = resolvePkg(s);
+                  if (pkg == null) {
+                      if (s.storeName != null) offerInstall(s); else pickApp(s);
+                      return;
+                  }
+                  if (!startFirst(Collections.singletonList(launchIntent(pkg)))) toast("Couldn't open " + s.name);
+              }
+
+              private void openWorld(String category, String q) {
+                  Intent i = new Intent(this, IptvActivity.class);
+                  i.putExtra(IptvActivity.EXTRA_KIND, IptvActivity.WORLD);
+                  if (category != null) i.putExtra(IptvActivity.EXTRA_CATEGORY, category);
+                  if (q != null) i.putExtra(IptvActivity.EXTRA_QUERY, q);
+                  startActivity(i);
+              }
+
+              private void sportsMenu() {
+                  final List<String> labels = new ArrayList<>();
+                  labels.add("Free sports channels from around the world");
+                  for (Service a : SPORTS_APPS) {
+                      labels.add(a.name + (resolvePkg(a) == null ? "   (get it)" : ""));
+                  }
+                  new AlertDialog.Builder(this)
+                      .setTitle("Sports")
+                      .setItems(labels.toArray(new String[0]), (d, w) -> {
+                          if (w == 0) openWorld(WorldTv.SPORTS, null);
+                          else launchOrInstall(SPORTS_APPS[w - 1]);
+                      })
+                      .setNegativeButton("Cancel", null)
+                      .show();
               }
 
               private void pickApp(final Service s) {
@@ -1606,6 +1987,10 @@ jobs:
               }
 
               private void tileOptions(final Service s) {
+                  if (s.id.equals("world") || s.id.equals("sports")) {
+                      openService(s);
+                      return;
+                  }
                   if (builtIn(s)) {
                       startActivity(new Intent(this, LoginActivity.class));
                       return;
@@ -1630,10 +2015,16 @@ jobs:
                   if (s.id.equals("movies")) { openIptv(Xtream.MOVIE); return; }
                   if (s.id.equals("series")) { openIptv(Xtream.SERIES); return; }
                   if (s.id.equals("live") && iptv()) { openIptv(Xtream.LIVE); return; }
+                  if (s.id.equals("world")) { openWorld(null, query()); return; }
+                  if (s.id.equals("sports")) { sportsMenu(); return; }
                   String pkg = resolvePkg(s);
                   if (pkg == null) {
-                      toast(s.name + " app not found. Choose which app to use.");
-                      pickApp(s);
+                      if (s.storeName != null) {
+                          offerInstall(s);
+                      } else {
+                          toast(s.name + " app not found. Choose which app to use.");
+                          pickApp(s);
+                      }
                       return;
                   }
                   String q = query();
@@ -1706,33 +2097,55 @@ jobs:
           import androidx.media3.ui.PlayerView;
 
           import java.util.ArrayList;
+          import java.util.HashMap;
+          import java.util.Locale;
+          import java.util.Map;
 
           /** Full-screen player. Live TV: Up/Down or CH+/CH- change channel. Movies/episodes resume where you left off. */
           public class PlayerActivity extends Activity {
 
               public static class Entry {
-                  public final String title, url;
-                  public Entry(String title, String url) { this.title = title; this.url = url; }
+                  public final String title, url, ua, ref;
+                  public Entry(String title, String url) { this(title, url, "", ""); }
+                  public Entry(String title, String url, String ua, String ref) {
+                      this.title = title;
+                      this.url = url;
+                      this.ua = ua == null ? "" : ua;
+                      this.ref = ref == null ? "" : ref;
+                  }
               }
 
               private static ArrayList<Entry> queue = new ArrayList<>();
               private static int startIndex;
               private static boolean startLive;
+              private static boolean startSkipBroken;
 
               public static void start(Context c, ArrayList<Entry> list, int index, boolean live) {
+                  start(c, list, index, live, false);
+              }
+
+              /** skipBroken: remember channels that fail and jump to the next one automatically. */
+              public static void start(Context c, ArrayList<Entry> list, int index, boolean live, boolean skipBroken) {
                   queue = list;
                   startIndex = index;
                   startLive = live;
+                  startSkipBroken = skipBroken;
                   c.startActivity(new Intent(c, PlayerActivity.class));
               }
 
+              private boolean skipBroken;
+              private int lastDir = 1;
+              private int failsInARow = 0;
+
               private ExoPlayer player;
+              private DefaultHttpDataSource.Factory http;
               private PlayerView view;
               private TextView overlay;
               private int index;
               private boolean live;
               private SharedPreferences resume;
               private final Handler h = new Handler(Looper.getMainLooper());
+              private final Runnable skipNext = () -> switchBy(lastDir);
               private final Runnable hideOverlay = () -> {
                   if (overlay != null) overlay.setVisibility(View.GONE);
               };
@@ -1747,6 +2160,7 @@ jobs:
                   index = savedInstanceState != null ? savedInstanceState.getInt("index", startIndex) : startIndex;
                   if (index < 0 || index >= queue.size()) index = 0;
                   live = startLive;
+                  skipBroken = startSkipBroken;
                   resume = getSharedPreferences("resume", MODE_PRIVATE);
 
                   getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
@@ -1799,7 +2213,7 @@ jobs:
               }
 
               private void initPlayer() {
-                  DefaultHttpDataSource.Factory http = new DefaultHttpDataSource.Factory()
+                  http = new DefaultHttpDataSource.Factory()
                       .setUserAgent(Xtream.UA)
                       .setAllowCrossProtocolRedirects(true)
                       .setConnectTimeoutMs(15000)
@@ -1820,6 +2234,16 @@ jobs:
                               player.prepare();
                               return;
                           }
+                          if (skipBroken) {
+                              ChannelCheck.markUrl(PlayerActivity.this, queue.get(index).url, false);
+                              failsInARow++;
+                              if (queue.size() > 1 && failsInARow < 6) {
+                                  showOverlay(queue.get(index).title + " isn't working right now \u2013 skipping to the next channel", 2500);
+                                  h.removeCallbacks(skipNext);
+                                  h.postDelayed(skipNext, 1500);
+                                  return;
+                              }
+                          }
                           String what = live ? "this channel" : "this video";
                           String hint = live && queue.size() > 1 ? "\nPress Up or Down for another channel." : "";
                           showOverlay("Can't play " + what + " right now." + hint + "\n(" + error.getErrorCodeName() + ")", 10000);
@@ -1827,6 +2251,10 @@ jobs:
 
                       @Override
                       public void onPlaybackStateChanged(int state) {
+                          if (state == Player.STATE_READY && skipBroken) {
+                              failsInARow = 0;
+                              ChannelCheck.markUrl(PlayerActivity.this, queue.get(index).url, true);
+                          }
                           if (state == Player.STATE_ENDED && !live) {
                               resume.edit().remove(key(queue.get(index))).apply();
                               if (index + 1 < queue.size()) {
@@ -1847,8 +2275,16 @@ jobs:
 
               private void play() {
                   Entry e = queue.get(index);
+                  // Some free channels only answer to a particular app name or referring website.
+                  http.setUserAgent(e.ua.isEmpty() ? Xtream.UA : e.ua);
+                  Map<String, String> headers = new HashMap<>();
+                  if (!e.ref.isEmpty()) headers.put("Referer", e.ref);
+                  http.setDefaultRequestProperties(headers);
+
                   MediaItem.Builder b = new MediaItem.Builder().setUri(e.url);
-                  if (e.url.contains(".m3u8")) b.setMimeType(MimeTypes.APPLICATION_M3U8);
+                  String lower = e.url.toLowerCase(Locale.ROOT);
+                  if (lower.contains(".m3u8")) b.setMimeType(MimeTypes.APPLICATION_M3U8);
+                  else if (lower.contains(".mpd")) b.setMimeType(MimeTypes.APPLICATION_MPD);
                   player.setMediaItem(b.build());
                   if (!live) {
                       long pos = resume.getLong(key(e), 0);
@@ -1873,6 +2309,7 @@ jobs:
               }
 
               private void releasePlayer() {
+                  h.removeCallbacks(skipNext);
                   if (player == null) return;
                   savePosition();
                   view.setPlayer(null);
@@ -1889,6 +2326,8 @@ jobs:
 
               private void switchBy(int d) {
                   if (player == null || queue.size() < 2) return;
+                  lastDir = d;
+                  h.removeCallbacks(skipNext);
                   index = (index + d + queue.size()) % queue.size();
                   play();
               }
@@ -1986,6 +2425,123 @@ jobs:
           }
           STREAMHUB_EOF
           mkdir -p app/src/main/java/com/dil/streamhub
+          cat > app/src/main/java/com/dil/streamhub/WorldTv.java <<'STREAMHUB_EOF'
+          package com.dil.streamhub;
+
+          import java.io.BufferedReader;
+          import java.io.IOException;
+          import java.io.InputStreamReader;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.nio.charset.StandardCharsets;
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.HashMap;
+          import java.util.List;
+          import java.util.Map;
+          import java.util.TreeSet;
+
+          /** Free, publicly published TV channels from the iptv-org list (the same source as the World TV page). */
+          final class WorldTv {
+              static final String SPORTS = "\u0001sports";
+              static final String HOME_COUNTRY = "South Africa";
+
+              private static final String COUNTRY_URL = "https://iptv-org.github.io/iptv/index.country.m3u";
+              private static final String SPORTS_URL = "https://iptv-org.github.io/iptv/categories/sports.m3u";
+
+              private static final Map<String, List<Xtream.Item>> CACHE =
+                  Collections.synchronizedMap(new HashMap<String, List<Xtream.Item>>());
+
+              private WorldTv() {}
+
+              static List<Xtream.Category> categories() throws IOException {
+                  List<Xtream.Item> all = load(COUNTRY_URL);
+                  TreeSet<String> countries = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+                  for (Xtream.Item i : all) if (!i.categoryId.isEmpty()) countries.add(i.categoryId);
+                  List<Xtream.Category> out = new ArrayList<>();
+                  out.add(new Xtream.Category(SPORTS, "⚽ Sports · worldwide"));
+                  if (countries.remove(HOME_COUNTRY)) out.add(new Xtream.Category(HOME_COUNTRY, HOME_COUNTRY));
+                  for (String c : countries) out.add(new Xtream.Category(c, c));
+                  return out;
+              }
+
+              /** categoryId null = every channel; SPORTS = sports channels from all countries; otherwise a country name. */
+              static List<Xtream.Item> items(String categoryId) throws IOException {
+                  if (SPORTS.equals(categoryId)) return load(SPORTS_URL);
+                  List<Xtream.Item> all = load(COUNTRY_URL);
+                  if (categoryId == null) return all;
+                  String key = "c|" + categoryId;
+                  List<Xtream.Item> cached = CACHE.get(key);
+                  if (cached != null) return cached;
+                  List<Xtream.Item> out = new ArrayList<>();
+                  for (Xtream.Item i : all) if (categoryId.equals(i.categoryId)) out.add(i);
+                  CACHE.put(key, out);
+                  return out;
+              }
+
+              private static List<Xtream.Item> load(String url) throws IOException {
+                  List<Xtream.Item> cached = CACHE.get(url);
+                  if (cached != null) return cached;
+
+                  HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+                  c.setConnectTimeout(15000);
+                  c.setReadTimeout(60000);
+                  c.setRequestProperty("User-Agent", Xtream.UA);
+                  int code = c.getResponseCode();
+                  if (code >= 400) {
+                      c.disconnect();
+                      throw new IOException("The channel list is unavailable right now (error " + code + "). Try again later.");
+                  }
+                  List<Xtream.Item> out = new ArrayList<>();
+                  BufferedReader r = new BufferedReader(new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8), 32768);
+                  try {
+                      Xtream.Item pending = null;
+                      String line;
+                      while ((line = r.readLine()) != null) {
+                          line = line.trim();
+                          if (line.isEmpty()) continue;
+                          if (line.startsWith("#EXTINF")) {
+                              pending = new Xtream.Item();
+                              pending.kind = IptvActivity.WORLD;
+                              pending.icon = attr(line, "tvg-logo");
+                              pending.categoryId = attr(line, "group-title");
+                              int end = line.indexOf("\",");
+                              int comma = end >= 0 ? end + 1 : line.indexOf(',');
+                              pending.name = comma >= 0 ? line.substring(comma + 1).trim() : "";
+                          } else if (line.startsWith("#EXTVLCOPT:")) {
+                              if (pending == null) continue;
+                              String opt = line.substring(11);
+                              if (opt.startsWith("http-user-agent=")) pending.ua = opt.substring(16).trim();
+                              else if (opt.startsWith("http-referrer=")) pending.ref = opt.substring(14).trim();
+                          } else if (!line.startsWith("#")) {
+                              if (pending != null && (line.startsWith("http://") || line.startsWith("https://"))) {
+                                  pending.id = line;
+                                  if (pending.name.isEmpty()) pending.name = "Channel";
+                                  out.add(pending);
+                              }
+                              pending = null;
+                          }
+                      }
+                  } finally {
+                      try { r.close(); } catch (Exception ignored) {}
+                      c.disconnect();
+                  }
+                  Collections.sort(out, (a, b) -> a.name.compareToIgnoreCase(b.name));
+                  CACHE.put(url, out);
+                  return out;
+              }
+
+              private static String attr(String line, String name) {
+                  String key = name + "=\"";
+                  int s = line.indexOf(key);
+                  if (s < 0) return "";
+                  s += key.length();
+                  int e = line.indexOf('"', s);
+                  return e < 0 ? "" : line.substring(s, e);
+              }
+          }
+          STREAMHUB_EOF
+          mkdir -p app/src/main/java/com/dil/streamhub
           cat > app/src/main/java/com/dil/streamhub/Xtream.java <<'STREAMHUB_EOF'
           package com.dil.streamhub;
 
@@ -2039,11 +2595,13 @@ jobs:
 
               public static class Item {
                   public String id = "", name = "", icon = "", ext = "", categoryId = "", kind = "", epgId = "";
+                  public String ua = "", ref = "";
 
                   public String key() { return kind + "\t" + id + "\t"; }
 
                   String serialize() {
-                      return kind + "\t" + id + "\t" + clean(name) + "\t" + clean(icon) + "\t" + clean(ext);
+                      return kind + "\t" + id + "\t" + clean(name) + "\t" + clean(icon) + "\t" + clean(ext)
+                          + "\t" + clean(ua) + "\t" + clean(ref);
                   }
 
                   static Item parse(String s) {
@@ -2051,6 +2609,7 @@ jobs:
                       if (p.length < 5) return null;
                       Item i = new Item();
                       i.kind = p[0]; i.id = p[1]; i.name = p[2]; i.icon = p[3]; i.ext = p[4];
+                      if (p.length >= 7) { i.ua = p[5]; i.ref = p[6]; }
                       return i;
                   }
 
